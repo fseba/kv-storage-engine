@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+indicatif = "0.18.3"
+reqwest = "0.13.1"
+tokio = { version = "1.49.0", features = ["full", "macros", "tokio-macros"] }

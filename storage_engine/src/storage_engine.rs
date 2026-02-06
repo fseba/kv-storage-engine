@@ -75,7 +75,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_set_and_get() {
+    fn set_and_get() {
         let mut engine = StorageEngine::new();
 
         engine.set("key1".to_string(), "value1".to_string());
@@ -83,13 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_nonexistent_key() {
+    fn get_nonexistent_key_return_none() {
         let engine = StorageEngine::new();
         assert_eq!(engine.get("nonexistent"), None);
     }
 
     #[test]
-    fn test_overwrite_existing_key() {
+    fn set_overwrites_existing_key() {
         let mut engine = StorageEngine::new();
 
         engine.set("key1".to_string(), "value1".to_string());
@@ -99,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_keys() {
+    fn multiple_keys_are_stored() {
         let mut engine = StorageEngine::new();
 
         engine.set("key1".to_string(), "value1".to_string());
@@ -112,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_strings() {
+    fn empty_strings_are_handled() {
         let mut engine = StorageEngine::new();
 
         engine.set("".to_string(), "".to_string());
