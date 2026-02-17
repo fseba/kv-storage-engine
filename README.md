@@ -6,6 +6,7 @@ This project implements a key-value storage engine in Rust. Based on [Build Your
 
 - Keys are lowercase ASCII strings.
 - Values are ASCII strings.
+- Implementation is single-threaded (Will be revisited later).
 > NOTE: Assumptions persist for the rest of the series unless explicitly discarded.
 
 ## Architecture
