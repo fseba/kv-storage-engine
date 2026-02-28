@@ -16,7 +16,9 @@ use storage_engine::StorageEngine;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let engine = Arc::new(Mutex::new(StorageEngine::new()));
+    let engine = Arc::new(Mutex::new(
+        StorageEngine::new("./").expect("Failed to initialize storage engine"),
+    ));
     let app = Router::new()
         .route("/{key}", get(get_value))
         .route("/{key}", put(set_value))

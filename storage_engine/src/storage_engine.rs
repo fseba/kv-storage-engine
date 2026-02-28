@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{BufWriter, Result},
-    path::PathBuf,
+    fs::{self, File},
+    io::{BufWriter, Result, Write},
+    path::{Path, PathBuf},
 };
 
 use serde_json::{Value, json};
 
 const MAX_ENTRIES: usize = 2000;
+const MANIFEST: &str = "MANIFEST";
 
 /// An in-memory key-value storage engine backed by SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
@@ -17,13 +18,13 @@ const MAX_ENTRIES: usize = 2000;
 /// ```
 /// use storage_engine::StorageEngine;
 ///
-/// let mut engine = StorageEngine::new();
+/// let mut engine = StorageEngine::new("./").unwrap();
 /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
 ///
 /// assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
 /// assert_eq!(engine.get("nonexistent"), None);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StorageEngine {
     memtable: HashMap<String, String>,
     directory_path: PathBuf,
@@ -31,19 +32,38 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    /// Creates a new empty storage engine.
+    /// Creates a new storage engine at the given directory path.
+    /// Reads the [`MANIFEST`] file to recover the SST file counter. If no
+    /// manifest exists, an empty one is created.
+    /// # Arguments
+    /// * `path` - Directory where SST and manifest files are stored
     /// # Examples
     /// ```
     /// use storage_engine::StorageEngine;
     ///
-    /// let engine = StorageEngine::new();
+    /// let engine = StorageEngine::new("./").unwrap();
     /// ```
-    pub fn new() -> Self {
-        Self {
+    /// # Errors
+    /// Returns an `io::Error` if the manifest file cannot be read or created.
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let mut engine = Self {
             memtable: HashMap::with_capacity(MAX_ENTRIES),
-            directory_path: PathBuf::from("./"),
+            directory_path: path.as_ref().to_path_buf(),
             sst_file_counter: 0,
+        };
+
+        let manifest_path = engine.directory_path.join(MANIFEST);
+        if manifest_path.exists() {
+            let content = fs::read_to_string(manifest_path)?;
+            if let Some(latest_file) = content.lines().last()
+                && let Some(counter) = parse_sst_filename(latest_file)
+            {
+                engine.sst_file_counter = counter;
+            }
+        } else {
+            File::create(manifest_path)?;
         }
+        Ok(engine)
     }
 
     /// Inserts a key-value pair into the storage engine.
@@ -56,7 +76,7 @@ impl StorageEngine {
     /// ```
     /// use storage_engine::StorageEngine;
     ///
-    /// let mut engine = StorageEngine::new();
+    /// let mut engine = StorageEngine::new("./").unwrap();
     /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
     /// ```
     /// # Errors
@@ -81,7 +101,7 @@ impl StorageEngine {
     /// ```
     /// use storage_engine::StorageEngine;
     ///
-    /// let mut engine = StorageEngine::new();
+    /// let mut engine = StorageEngine::new("./").unwrap();
     /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
     ///
     /// assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
@@ -104,6 +124,12 @@ impl StorageEngine {
         let file = File::create(self.directory_path.join(file_name))?;
         let json_flush = self.sort_memtable();
         serde_json::to_writer(BufWriter::new(file), &json_flush)?;
+        // TODO: how to add to file and not repalce?
+        let mut manifest = File::options()
+            .create(true)
+            .append(true)
+            .open(self.directory_path.join(MANIFEST))?;
+        writeln!(manifest, "sst-{}.json", tmp_count)?;
         self.sst_file_counter += 1;
         self.memtable.clear();
         Ok(())
@@ -124,6 +150,14 @@ impl StorageEngine {
     }
 }
 
+fn parse_sst_filename(filename: &str) -> Option<usize> {
+    filename
+        .strip_prefix("sst-")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -134,7 +168,7 @@ mod tests {
 
     #[test]
     fn set_and_get() {
-        let mut engine = StorageEngine::new();
+        let mut engine = StorageEngine::new("./").unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -144,13 +178,13 @@ mod tests {
 
     #[test]
     fn get_nonexistent_key_return_none() {
-        let engine = StorageEngine::new();
+        let engine = StorageEngine::new("./").unwrap();
         assert_eq!(engine.get("nonexistent"), None);
     }
 
     #[test]
     fn set_overwrites_existing_key() {
-        let mut engine = StorageEngine::new();
+        let mut engine = StorageEngine::new("./").unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -164,7 +198,7 @@ mod tests {
 
     #[test]
     fn multiple_keys_are_stored() {
-        let mut engine = StorageEngine::new();
+        let mut engine = StorageEngine::new("./").unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -183,7 +217,7 @@ mod tests {
 
     #[test]
     fn empty_strings_are_handled() {
-        let mut engine = StorageEngine::new();
+        let mut engine = StorageEngine::new("./").unwrap();
 
         engine.set("".to_string(), "".to_string()).unwrap();
         assert_eq!(engine.get(""), Some(&"".to_string()));
@@ -323,5 +357,51 @@ mod tests {
             "Flush should fail due to invalid directory"
         );
         assert_eq!(engine.sst_file_counter, 0, "Counter should still be zero");
+    }
+
+    #[test]
+    fn new_should_set_counter_from_latest_sst_table_file_name_in_manifest() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(MANIFEST), "sst-1.json").unwrap();
+
+        let engine = StorageEngine::new(dir.path()).unwrap();
+
+        assert_eq!(
+            engine.sst_file_counter, 1,
+            "File counter not correctly parsed from manifest"
+        );
+    }
+
+    #[test]
+    fn new_should_create_manifest_file() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join(MANIFEST);
+
+        assert!(
+            !manifest_path.exists(),
+            "Manifest file should not exist before initialization"
+        );
+
+        let _engine = StorageEngine::new(dir.path()).unwrap();
+
+        assert!(
+            manifest_path.exists(),
+            "Manifest file should be created during initialization"
+        );
+    }
+
+    #[test]
+    fn flush_should_write_sst_table_file_name_to_manifest() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+
+        engine.flush().unwrap();
+        engine.flush().unwrap();
+
+        let manifest_content = fs::read_to_string(dir.path().join(MANIFEST)).unwrap();
+        assert_eq!(
+            manifest_content, "sst-1.json\nsst-2.json\n",
+            "Manifest should contain the latest SST file name"
+        );
     }
 }
