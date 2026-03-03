@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufWriter, Result, Write},
+    io::{BufReader, BufWriter, Result, Write},
     path::{Path, PathBuf},
 };
 
@@ -90,13 +90,14 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Retrieves a reference to the value associated with the given key.
-    /// Returns `None` if the key is not found in the storage engine.
+    /// Retrieves the value associated with the given key.
+    /// Checks the in-memory memtable first. If not found, performs a linear scan
+    /// across SST files listed in the MANIFEST from newest to oldest.
+    /// Returns `None` if the key is not found in either the memtable or any SST file.
     /// # Arguments
     /// * `key` - The key to look up
     /// # Returns
-    /// An `Option<&String>` containing a reference to the value if found,
-    /// or `None` if the key doesn't exist.
+    /// An `Option<String>` containing the value if found, or `None` if the key doesn't exist.
     /// # Examples
     /// ```
     /// use storage_engine::StorageEngine;
@@ -104,11 +105,28 @@ impl StorageEngine {
     /// let mut engine = StorageEngine::new("./").unwrap();
     /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
     ///
-    /// assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
+    /// assert_eq!(engine.get("key1"), Some("value1".to_string()));
     /// assert_eq!(engine.get("key2"), None);
     /// ```
-    pub fn get(&self, key: &str) -> Option<&String> {
-        self.memtable.get(key)
+    pub fn get(&self, key: &str) -> Option<String> {
+        if let Some(value) = self.memtable.get(key) {
+            return Some(value.clone());
+        }
+
+        let manifest_content = fs::read_to_string(self.directory_path.join(MANIFEST)).ok()?;
+        for sst_file in manifest_content.lines().rev() {
+            if let Ok(file) = File::open(self.directory_path.join(sst_file)) {
+                let value = serde_json::from_reader::<_, Vec<Value>>(BufReader::new(file))
+                    .ok()?
+                    .iter()
+                    .filter_map(|entry| entry.as_object())
+                    .find_map(|obj| obj.get(key).and_then(|v| v.as_str().map(|s| s.to_string())));
+                if value.is_some() {
+                    return value;
+                }
+            }
+        }
+        None
     }
 
     /// Flushes the in-memory key-value pairs to disk as a sorted JSON array.
@@ -173,7 +191,6 @@ mod tests {
         engine
             .set("key1".to_string(), "value1".to_string())
             .unwrap();
-        assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
     }
 
     #[test]
@@ -193,7 +210,7 @@ mod tests {
             .set("key1".to_string(), "new_value".to_string())
             .unwrap();
 
-        assert_eq!(engine.get("key1"), Some(&"new_value".to_string()));
+        assert_eq!(engine.get("key1"), Some("new_value".to_string()));
     }
 
     #[test]
@@ -210,9 +227,9 @@ mod tests {
             .set("key3".to_string(), "value3".to_string())
             .unwrap();
 
-        assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
-        assert_eq!(engine.get("key2"), Some(&"value2".to_string()));
-        assert_eq!(engine.get("key3"), Some(&"value3".to_string()));
+        assert_eq!(engine.get("key1"), Some("value1".to_string()));
+        assert_eq!(engine.get("key2"), Some("value2".to_string()));
+        assert_eq!(engine.get("key3"), Some("value3".to_string()));
     }
 
     #[test]
@@ -220,13 +237,47 @@ mod tests {
         let mut engine = StorageEngine::new("./").unwrap();
 
         engine.set("".to_string(), "".to_string()).unwrap();
-        assert_eq!(engine.get(""), Some(&"".to_string()));
+        assert_eq!(engine.get(""), Some("".to_string()));
 
         engine.set("key".to_string(), "".to_string()).unwrap();
-        assert_eq!(engine.get("key"), Some(&"".to_string()));
+        assert_eq!(engine.get("key"), Some("".to_string()));
 
         engine.set("".to_string(), "value".to_string()).unwrap();
-        assert_eq!(engine.get(""), Some(&"value".to_string()));
+        assert_eq!(engine.get(""), Some("value".to_string()));
+    }
+
+    #[test]
+    fn get_finds_values_in_sstable_files() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine {
+            memtable: HashMap::new(),
+            directory_path: dir.path().to_path_buf(),
+            sst_file_counter: 0,
+        };
+
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+        engine.flush().unwrap();
+
+        assert_eq!(engine.get("key1"), Some("value1".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_if_value_not_found_in_sstabe_file() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine {
+            memtable: HashMap::new(),
+            directory_path: dir.path().to_path_buf(),
+            sst_file_counter: 0,
+        };
+
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+        engine.flush().unwrap();
+
+        assert_eq!(engine.get("nonexistent"), None);
     }
 
     #[test]

@@ -36,7 +36,7 @@ async fn get_value(
     Path(key): Path<String>,
 ) -> Result<String, StatusCode> {
     if let Some(v) = engine.lock().expect("mutex was poisoned").get(&key) {
-        Ok(v.clone())
+        Ok(v)
     } else {
         Err(StatusCode::NOT_FOUND)
     }
