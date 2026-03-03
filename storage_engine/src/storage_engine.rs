@@ -140,9 +140,8 @@ impl StorageEngine {
         let file_name = format!("sst-{tmp_count}.json");
         // INFO: Truncates file
         let file = File::create(self.directory_path.join(file_name))?;
-        let json_flush = self.sort_memtable();
-        serde_json::to_writer(BufWriter::new(file), &json_flush)?;
-        // TODO: how to add to file and not repalce?
+        let content = self.create_flush_content();
+        serde_json::to_writer(BufWriter::new(file), &content)?;
         let mut manifest = File::options()
             .create(true)
             .append(true)
@@ -153,11 +152,12 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn sort_memtable(&mut self) -> Value {
+    fn create_flush_content(&mut self) -> Value {
         let mut entries: Vec<(&String, &String)> = self.memtable.iter().collect();
         entries.sort_by_key(|(k, _)| *k);
         let json_flush: Value = entries
             .iter()
+            .take(MAX_ENTRIES)
             .map(|(k, v)| {
                 let key = k.to_string();
                 let value = v.to_string();
