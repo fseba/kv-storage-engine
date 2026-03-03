@@ -113,8 +113,8 @@ impl StorageEngine {
             return Some(value.clone());
         }
 
-        let manifest_content = fs::read_to_string(self.directory_path.join(MANIFEST)).ok()?;
-        for sst_file in manifest_content.lines().rev() {
+        for n in (1..=self.sst_file_counter).rev() {
+            let sst_file = format!("sst-{n}.json");
             if let Ok(file) = File::open(self.directory_path.join(sst_file)) {
                 let value = serde_json::from_reader::<_, Vec<Value>>(BufReader::new(file))
                     .ok()?
