@@ -168,6 +168,14 @@ impl StorageEngine {
     }
 }
 
+impl Drop for StorageEngine {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            eprintln!("Error during flush: {}", e);
+        }
+    }
+}
+
 fn parse_sst_filename(filename: &str) -> Option<usize> {
     filename
         .strip_prefix("sst-")?
@@ -453,6 +461,20 @@ mod tests {
         assert_eq!(
             manifest_content, "sst-1.json\nsst-2.json\n",
             "Manifest should contain the latest SST file name"
+        );
+    }
+
+    #[test]
+    fn engine_drop_should_trigger_flush() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+        drop(engine);
+        assert!(
+            fs::exists(dir.path().join("sst-1.json")).unwrap(),
+            "SST file should exist after engine is dropped"
         );
     }
 }
