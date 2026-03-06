@@ -1,3 +1,5 @@
+mod lru_cache;
+
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -6,6 +8,8 @@ use std::{
 };
 
 use serde_json::{Value, json};
+
+use crate::storage_engine::lru_cache::LRUCache;
 
 const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
@@ -21,7 +25,7 @@ const MANIFEST: &str = "MANIFEST";
 /// let mut engine = StorageEngine::new("./").unwrap();
 /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
 ///
-/// assert_eq!(engine.get("key1"), Some(&"value1".to_string()));
+/// assert_eq!(engine.get("key1"), Some("value1".to_string()));
 /// assert_eq!(engine.get("nonexistent"), None);
 /// ```
 #[derive(Debug)]
@@ -29,6 +33,7 @@ pub struct StorageEngine {
     memtable: HashMap<String, String>,
     directory_path: PathBuf,
     sst_file_counter: usize,
+    negative_cache: LRUCache,
 }
 
 impl StorageEngine {
@@ -50,6 +55,7 @@ impl StorageEngine {
             memtable: HashMap::with_capacity(MAX_ENTRIES),
             directory_path: path.as_ref().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         let manifest_path = engine.directory_path.join(MANIFEST);
@@ -83,6 +89,7 @@ impl StorageEngine {
     /// Returns an `io::Error` if there is an issue flushing the memtable to disk when the number
     /// of entries exceeds the threshold.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        self.negative_cache.remove(&key);
         self.memtable.insert(key, value);
         if self.memtable.len() >= MAX_ENTRIES {
             self.flush()?;
@@ -91,9 +98,10 @@ impl StorageEngine {
     }
 
     /// Retrieves the value associated with the given key.
-    /// Checks the in-memory memtable first. If not found, performs a linear scan
-    /// across SST files listed in the MANIFEST from newest to oldest.
-    /// Returns `None` if the key is not found in either the memtable or any SST file.
+    /// Checks the in-memory memtable first, then the negative cache (keys confirmed absent).
+    /// If not found in either, performs a linear scan across SST files from newest to oldest.
+    /// On a miss, the key is added to the negative cache to skip SST scans on future lookups.
+    /// Returns `None` if the key is not found anywhere.
     /// # Arguments
     /// * `key` - The key to look up
     /// # Returns
@@ -108,9 +116,12 @@ impl StorageEngine {
     /// assert_eq!(engine.get("key1"), Some("value1".to_string()));
     /// assert_eq!(engine.get("key2"), None);
     /// ```
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&mut self, key: &str) -> Option<String> {
         if let Some(value) = self.memtable.get(key) {
             return Some(value.clone());
+        }
+        if self.negative_cache.contains(key) {
+            return None;
         }
 
         for n in (1..=self.sst_file_counter).rev() {
@@ -126,6 +137,7 @@ impl StorageEngine {
                 }
             }
         }
+        self.negative_cache.insert(key.to_string());
         None
     }
 
@@ -203,7 +215,7 @@ mod tests {
 
     #[test]
     fn get_nonexistent_key_return_none() {
-        let engine = StorageEngine::new("./").unwrap();
+        let mut engine = StorageEngine::new("./").unwrap();
         assert_eq!(engine.get("nonexistent"), None);
     }
 
@@ -261,6 +273,7 @@ mod tests {
             memtable: HashMap::new(),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine
@@ -278,6 +291,7 @@ mod tests {
             memtable: HashMap::new(),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine
@@ -297,6 +311,7 @@ mod tests {
                 .collect(),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine
@@ -320,6 +335,7 @@ mod tests {
             ]),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine.flush().unwrap();
@@ -338,6 +354,7 @@ mod tests {
             ]),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine.flush().unwrap();
@@ -362,6 +379,7 @@ mod tests {
             ]),
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         let result = engine.flush();
@@ -387,6 +405,7 @@ mod tests {
             ]),
             directory_path: dir.path().to_path_buf(),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         engine.flush().unwrap();
@@ -407,6 +426,7 @@ mod tests {
             ]),
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
+            negative_cache: LRUCache::new(100),
         };
 
         let result = engine.flush();
