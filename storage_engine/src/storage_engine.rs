@@ -1,11 +1,11 @@
-mod lru_cache;
-
 use std::{
     collections::HashMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Result, Write},
     path::{Path, PathBuf},
 };
+
+mod lru_cache;
 
 use serde_json::{Value, json};
 
@@ -206,22 +206,26 @@ mod tests {
 
     #[test]
     fn set_and_get() {
-        let mut engine = StorageEngine::new("./").unwrap();
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
             .unwrap();
+        assert_eq!(engine.get("key1"), Some("value1".to_string()));
     }
 
     #[test]
     fn get_nonexistent_key_return_none() {
-        let mut engine = StorageEngine::new("./").unwrap();
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
         assert_eq!(engine.get("nonexistent"), None);
     }
 
     #[test]
     fn set_overwrites_existing_key() {
-        let mut engine = StorageEngine::new("./").unwrap();
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -235,7 +239,8 @@ mod tests {
 
     #[test]
     fn multiple_keys_are_stored() {
-        let mut engine = StorageEngine::new("./").unwrap();
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -254,7 +259,8 @@ mod tests {
 
     #[test]
     fn empty_strings_are_handled() {
-        let mut engine = StorageEngine::new("./").unwrap();
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine.set("".to_string(), "".to_string()).unwrap();
         assert_eq!(engine.get(""), Some("".to_string()));
