@@ -9,10 +9,12 @@ mod lru_cache;
 
 use serde_json::{Value, json};
 
-use crate::storage_engine::lru_cache::LRUCache;
+use lru_cache::LRUCache;
 
 const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
+const MANIFEST_TEMP: &str = "MANIFEST.tmp";
+const WAL: &str = "wal.db";
 
 /// An in-memory key-value storage engine backed by SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
@@ -69,7 +71,35 @@ impl StorageEngine {
         } else {
             File::create(manifest_path)?;
         }
+
+        let wal_path = engine.directory_path.join(WAL);
+        if wal_path.exists() {
+            let wal = fs::read_to_string(wal_path)?;
+            for wal_entry in wal.lines() {
+                if let Ok(record) = serde_json::from_str::<WALRecord>(wal_entry) {
+                    match record.op {
+                        WALRecordType::Put => engine.memtable.insert(record.key, record.value),
+                    };
+                }
+                if engine.memtable.len() >= MAX_ENTRIES {
+                    engine.flush()?;
+                }
+            }
+        } else {
+            let wal = File::create(wal_path)?;
+            wal.sync_data()?;
+            engine.sync_parent_dir()?;
+        }
         Ok(engine)
+    }
+
+    /// Ensures that the parent directory of the storage engine is synced to disk.
+    /// Use after creating a new file.
+    /// # Errors
+    /// Returns an `io::Error` if there is an issue opening or syncing the directory.
+    fn sync_parent_dir(&self) -> Result<()> {
+        let dir = File::open(self.directory_path.as_path())?;
+        dir.sync_all()
     }
 
     /// Inserts a key-value pair into the storage engine.
@@ -89,6 +119,17 @@ impl StorageEngine {
     /// Returns an `io::Error` if there is an issue flushing the memtable to disk when the number
     /// of entries exceeds the threshold.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        let wal_record = WALRecord {
+            op: WALRecordType::Put,
+            key: key.clone(),
+            value: value.clone(),
+        };
+        let mut wal = File::options()
+            .append(true)
+            .open(self.directory_path.join(WAL))?;
+        writeln!(wal, "{}", serde_json::to_string(&wal_record)?)?;
+        wal.sync_data()?;
+
         self.negative_cache.remove(&key);
         self.memtable.insert(key, value);
         if self.memtable.len() >= MAX_ENTRIES {
@@ -149,16 +190,34 @@ impl StorageEngine {
     /// Returns an `io::Error` if there is an issue creating or writing to the file.
     fn flush(&mut self) -> Result<()> {
         let tmp_count = self.sst_file_counter + 1;
-        let file_name = format!("sst-{tmp_count}.json");
+        let sst_file_name = format!("sst-{tmp_count}.json");
         // INFO: Truncates file
-        let file = File::create(self.directory_path.join(file_name))?;
-        let content = self.create_flush_content();
-        serde_json::to_writer(BufWriter::new(file), &content)?;
-        let mut manifest = File::options()
+        let sst_file = File::create(self.directory_path.join(&sst_file_name))?;
+        let flush_content = self.create_flush_content();
+        serde_json::to_writer(BufWriter::new(&sst_file), &flush_content)?;
+        sst_file.sync_data()?;
+
+        // Update the manifest with the new SST file name
+        let mut manifest_content = fs::read(self.directory_path.join(MANIFEST))?;
+        writeln!(manifest_content, "{}", sst_file_name)?;
+        let mut manifest_temp = File::options()
             .create(true)
-            .append(true)
-            .open(self.directory_path.join(MANIFEST))?;
-        writeln!(manifest, "sst-{}.json", tmp_count)?;
+            .write(true)
+            .truncate(true)
+            .open(self.directory_path.join(MANIFEST_TEMP))?;
+        manifest_temp.write_all(&manifest_content)?;
+        manifest_temp.sync_data()?;
+        fs::rename(
+            self.directory_path.join(MANIFEST_TEMP),
+            self.directory_path.join(MANIFEST),
+        )?;
+        let manifest = File::open(self.directory_path.join(MANIFEST))?;
+        manifest.sync_data()?;
+        self.sync_parent_dir()?;
+
+        // Clear the WAL after a successful flush
+        File::create(self.directory_path.join(WAL))?.sync_data()?;
+
         self.sst_file_counter += 1;
         self.memtable.clear();
         Ok(())
@@ -188,6 +247,18 @@ impl Drop for StorageEngine {
     }
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct WALRecord {
+    op: WALRecordType,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+enum WALRecordType {
+    Put,
+}
+
 fn parse_sst_filename(filename: &str) -> Option<usize> {
     filename
         .strip_prefix("sst-")?
@@ -213,6 +284,20 @@ mod tests {
             .set("key1".to_string(), "value1".to_string())
             .unwrap();
         assert_eq!(engine.get("key1"), Some("value1".to_string()));
+    }
+
+    #[test]
+    fn set_and_get_with_engine_restart() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+
+        let mut restarted_engine = StorageEngine::new(dir.path()).unwrap();
+
+        assert_eq!(restarted_engine.get("key1"), Some("value1".to_string()));
     }
 
     #[test]
@@ -275,12 +360,7 @@ mod tests {
     #[test]
     fn get_finds_values_in_sstable_files() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: HashMap::new(),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -293,12 +373,7 @@ mod tests {
     #[test]
     fn get_returns_none_if_value_not_found_in_sstabe_file() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: HashMap::new(),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         engine
             .set("key1".to_string(), "value1".to_string())
@@ -311,14 +386,10 @@ mod tests {
     #[test]
     fn two_thousand_or_more_entries_trigger_a_flush() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: (0..1999u32)
-                .map(|i| (format!("key_{i}"), format!("value_{i}")))
-                .collect(),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine.memtable = (0..1999u32)
+            .map(|i| (format!("key_{i}"), format!("value_{i}")))
+            .collect();
 
         engine
             .set("key_2000".to_string(), "value_2000".to_string())
@@ -333,16 +404,12 @@ mod tests {
     #[test]
     fn flush_creates_a_sorted_json_array_sst_file() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: HashMap::from([
-                ("a".to_string(), "v_1".to_string()),
-                ("b".to_string(), "v_2".to_string()),
-                ("c".to_string(), "v_3".to_string()),
-            ]),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine.memtable = HashMap::from([
+            ("b".to_string(), "v_2".to_string()),
+            ("c".to_string(), "v_3".to_string()),
+            ("a".to_string(), "v_1".to_string()),
+        ]);
 
         engine.flush().unwrap();
         let content = fs::read_to_string(dir.path().join("sst-1.json")).unwrap();
@@ -352,16 +419,12 @@ mod tests {
     #[test]
     fn memtable_is_cleared_after_successful_flush() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: HashMap::from([
-                ("a".to_string(), "v_1".to_string()),
-                ("b".to_string(), "v_2".to_string()),
-                ("c".to_string(), "v_3".to_string()),
-            ]),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine.memtable = HashMap::from([
+            ("a".to_string(), "v_1".to_string()),
+            ("b".to_string(), "v_2".to_string()),
+            ("c".to_string(), "v_3".to_string()),
+        ]);
 
         engine.flush().unwrap();
 
@@ -377,16 +440,14 @@ mod tests {
 
     #[test]
     fn memtable_is_not_cleared_after_failed_flush() {
-        let mut engine = StorageEngine {
-            memtable: HashMap::from([
-                ("a".to_string(), "v_1".to_string()),
-                ("b".to_string(), "v_2".to_string()),
-                ("c".to_string(), "v_3".to_string()),
-            ]),
-            directory_path: PathBuf::from("/non/existent/directory"),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine.memtable = HashMap::from([
+            ("a".to_string(), "v_1".to_string()),
+            ("b".to_string(), "v_2".to_string()),
+            ("c".to_string(), "v_3".to_string()),
+        ]);
+        engine.directory_path = PathBuf::from("/non/existent/directory");
 
         let result = engine.flush();
 
@@ -403,16 +464,12 @@ mod tests {
     #[test]
     fn flush_should_increase_counter_on_success() {
         let dir = tempdir().unwrap();
-        let mut engine = StorageEngine {
-            memtable: HashMap::from([
-                ("a".to_string(), "v_1".to_string()),
-                ("b".to_string(), "v_2".to_string()),
-                ("c".to_string(), "v_3".to_string()),
-            ]),
-            directory_path: dir.path().to_path_buf(),
-            sst_file_counter: 0,
-            negative_cache: LRUCache::new(100),
-        };
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        engine.memtable = HashMap::from([
+            ("a".to_string(), "v_1".to_string()),
+            ("b".to_string(), "v_2".to_string()),
+            ("c".to_string(), "v_3".to_string()),
+        ]);
 
         engine.flush().unwrap();
         engine.flush().unwrap();
@@ -502,5 +559,38 @@ mod tests {
             fs::exists(dir.path().join("sst-1.json")).unwrap(),
             "SST file should exist after engine is dropped"
         );
+    }
+
+    #[test]
+    fn wal_file_should_be_created_on_startup() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join(WAL);
+        assert!(
+            !wal_path.exists(),
+            "WAL file should not exist before initialization"
+        );
+
+        let _engine = StorageEngine::new(dir.path()).unwrap();
+
+        assert!(
+            wal_path.exists(),
+            "WAL file should be created during initialization"
+        );
+    }
+
+    #[test]
+    fn wal_content_should_be_insert_in_memtable_on_startup() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join(WAL);
+        let wal_record = WALRecord {
+            op: WALRecordType::Put,
+            key: "key1".to_string(),
+            value: "value1".to_string(),
+        };
+        fs::write(wal_path, serde_json::to_string(&wal_record).unwrap()).unwrap();
+
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+
+        assert_eq!(engine.get("key1"), Some("value1".to_string()));
     }
 }
