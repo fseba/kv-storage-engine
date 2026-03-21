@@ -7,6 +7,8 @@ use std::{
 use indicatif::ProgressBar;
 
 use reqwest::StatusCode;
+use reqwest_middleware::ClientBuilder;
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
 struct Request {
     pub method: String,
@@ -21,7 +23,7 @@ fn calc_percentile(percentile: f64, latencies: &[u128]) -> f64 {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
+async fn main() -> Result<(), reqwest_middleware::Error> {
     let file = BufReader::new(File::open("put.txt").unwrap());
     let mut requests: Vec<Request> = file
         .lines()
@@ -41,24 +43,30 @@ async fn main() -> Result<(), reqwest::Error> {
         })
         .collect();
 
-    let client = reqwest::Client::new();
+    let client = ClientBuilder::new(reqwest::Client::new())
+        .with(RetryTransientMiddleware::new_with_policy(
+            ExponentialBackoff::builder()
+                .build_with_total_retry_duration(std::time::Duration::from_secs(10)),
+        ))
+        .build();
     let base_url = "http://127.0.0.1:8080";
     let mut get_latencies: Vec<u128> = Vec::new();
     let mut put_latencies: Vec<u128> = Vec::new();
 
     let bar = ProgressBar::new(requests.len() as u64);
     let timer_all = Instant::now();
+    let mut last_successful_put_request: Option<Request> = None;
     for request in &mut requests {
         let timer_request = Instant::now();
         let url = format!("{base_url}/{}", request.key);
         if request.method == "PUT" {
-            let res = client.put(url).body(request.value.clone()).send().await?;
+            let res = client.put(&url).body(request.value.clone()).send().await?;
             put_latencies.push(timer_request.elapsed().as_micros());
             request.success = res.status() == StatusCode::OK;
             let msg = format!("PUT request successful: {}", request.success);
             bar.println(msg);
         } else {
-            let res = client.get(url).send().await?;
+            let res = client.get(&url).send().await?;
             get_latencies.push(timer_request.elapsed().as_micros());
             if request.value == "NOT_FOUND" {
                 request.success = res.status() == StatusCode::NOT_FOUND;
@@ -71,6 +79,54 @@ async fn main() -> Result<(), reqwest::Error> {
             let msg = format!("GET request successful: {}", request.success);
             bar.println(msg);
         };
+
+        // If the request took longer than 1 second, we assume that the kv-store-engine might have been
+        // restarted during the request. We then if the last successful PUT before the restart has been stored correctly
+        if timer_request.elapsed().as_secs() > 1
+            && request.success
+            && let Some(last_put) = &last_successful_put_request
+        {
+            bar.println(format!(
+                "----- Request for key {} took longer than 1 second, checking for data consistency -----",
+                request.key
+            ));
+            let url = format!("{base_url}/{}", last_put.key);
+            let res = client.get(url).send().await?;
+            if res.status() == StatusCode::OK {
+                match res.text().await {
+                    Ok(v) => {
+                        if v != last_put.value {
+                            let msg = format!(
+                                "Data inconsistency detected for key {}: expected '{}', got '{}'",
+                                last_put.key, last_put.value, v
+                            );
+                            bar.println(msg);
+                        } else {
+                            let msg = format!(
+                                "Data consistency verified for key {} after retry",
+                                last_put.key
+                            );
+                            bar.println(msg);
+                        }
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "Failed to retrieve value for key {} after retry",
+                            last_put.key
+                        );
+                        bar.println(msg);
+                    }
+                }
+            }
+        }
+        if request.success && request.method == "PUT" {
+            last_successful_put_request = Some(Request {
+                method: request.method.clone(),
+                key: request.key.clone(),
+                value: request.value.clone(),
+                success: request.success,
+            });
+        }
         bar.inc(1);
     }
     bar.finish();
