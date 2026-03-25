@@ -18,8 +18,11 @@ const WAL: &str = "wal.db";
 
 /// An in-memory key-value storage engine backed by SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
-/// string key-value pairs. Writes go to an in-memory `HashMap` (memtable)
-/// that is flushed to a sorted SST file on disk once it reaches [`MAX_ENTRIES`].
+/// string key-value pairs. Each write is first appended to a write-ahead log
+/// (WAL) for durability, then inserted into an in-memory `HashMap` (memtable).
+/// When the memtable reaches [`MAX_ENTRIES`], it is flushed to a sorted SST
+/// file on disk and the WAL is cleared. On startup, any unflushed WAL entries
+/// are replayed into the memtable to recover writes from the last session.
 /// # Examples
 /// ```
 /// use storage_engine::StorageEngine;
@@ -40,10 +43,12 @@ pub struct StorageEngine {
 
 impl StorageEngine {
     /// Creates a new storage engine at the given directory path.
-    /// Reads the [`MANIFEST`] file to recover the SST file counter. If no
-    /// manifest exists, an empty one is created.
+    /// Reads the [`MANIFEST`] file to recover the SST file counter. If the WAL
+    /// exists, its entries are replayed into the memtable to recover any writes
+    /// from the previous session that were not yet flushed. If either file does
+    /// not exist, an empty one is created.
     /// # Arguments
-    /// * `path` - Directory where SST and manifest files are stored
+    /// * `path` - Directory where SST, manifest, and WAL files are stored
     /// # Examples
     /// ```
     /// use storage_engine::StorageEngine;
@@ -51,7 +56,7 @@ impl StorageEngine {
     /// let engine = StorageEngine::new("./").unwrap();
     /// ```
     /// # Errors
-    /// Returns an `io::Error` if the manifest file cannot be read or created.
+    /// Returns an `io::Error` if any file cannot be read, created, or synced.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let mut engine = Self {
             memtable: HashMap::with_capacity(MAX_ENTRIES),
@@ -116,8 +121,8 @@ impl StorageEngine {
     /// engine.set("key1".to_string(), "value1".to_string()).unwrap();
     /// ```
     /// # Errors
-    /// Returns an `io::Error` if there is an issue flushing the memtable to disk when the number
-    /// of entries exceeds the threshold.
+    /// Returns an `io::Error` if the WAL cannot be written or synced, or if
+    /// flushing the memtable to disk fails when the entry threshold is reached.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let wal_record = WALRecord {
             op: WALRecordType::Put,
@@ -183,11 +188,13 @@ impl StorageEngine {
     }
 
     /// Flushes the in-memory key-value pairs to disk as a sorted JSON array.
-    /// The key-value pairs are written to a file named `sst-{N}.json` (where N is an
-    /// incrementing counter) in the configured directory.
-    /// After a successful flush, the memtable is cleared and the counter is incremented.
+    /// The key-value pairs are written to a file named `sst-{N}.json` (where N
+    /// is an incrementing counter) in the configured directory. The manifest is
+    /// updated atomically via a temp file rename. After a successful flush, the
+    /// WAL is cleared, the memtable is cleared, and the counter is incremented.
     /// # Errors
-    /// Returns an `io::Error` if there is an issue creating or writing to the file.
+    /// Returns an `io::Error` if there is an issue creating, writing, or syncing
+    /// any of the SST, manifest, or WAL files.
     fn flush(&mut self) -> Result<()> {
         let tmp_count = self.sst_file_counter + 1;
         let sst_file_name = format!("sst-{tmp_count}.json");
@@ -223,7 +230,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn create_flush_content(&mut self) -> Value {
+    fn create_flush_content(&self) -> Value {
         let mut entries: Vec<(&String, &String)> = self.memtable.iter().collect();
         entries.sort_by_key(|(k, _)| *k);
         let json_flush: Value = entries
@@ -236,14 +243,6 @@ impl StorageEngine {
             })
             .collect();
         json_flush
-    }
-}
-
-impl Drop for StorageEngine {
-    fn drop(&mut self) {
-        if let Err(e) = self.flush() {
-            eprintln!("Error during flush: {}", e);
-        }
     }
 }
 
@@ -504,7 +503,7 @@ mod tests {
     #[test]
     fn new_should_set_counter_from_latest_sst_table_file_name_in_manifest() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join(MANIFEST), "sst-1.json").unwrap();
+        fs::write(dir.path().join(MANIFEST), "sst-1.json\n").unwrap();
 
         let engine = StorageEngine::new(dir.path()).unwrap();
 
@@ -548,20 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_drop_should_trigger_flush() {
-        let dir = tempdir().unwrap();
-        let mut engine = StorageEngine::new(dir.path()).unwrap();
-        engine
-            .set("key1".to_string(), "value1".to_string())
-            .unwrap();
-        drop(engine);
-        assert!(
-            fs::exists(dir.path().join("sst-1.json")).unwrap(),
-            "SST file should exist after engine is dropped"
-        );
-    }
-
-    #[test]
     fn wal_file_should_be_created_on_startup() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join(WAL);
@@ -587,7 +572,8 @@ mod tests {
             key: "key1".to_string(),
             value: "value1".to_string(),
         };
-        fs::write(wal_path, serde_json::to_string(&wal_record).unwrap()).unwrap();
+        let wal_content = serde_json::to_string(&wal_record).unwrap();
+        fs::write(wal_path, wal_content + "\n").unwrap();
 
         let mut engine = StorageEngine::new(dir.path()).unwrap();
 
