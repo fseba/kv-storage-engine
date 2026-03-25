@@ -11,15 +11,64 @@ use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
 struct Request {
-    pub method: String,
-    pub key: String,
-    pub value: String,
-    pub success: bool,
+    method: String,
+    key: String,
+    value: String,
+    success: bool,
 }
 
 fn calc_percentile(percentile: f64, latencies: &[u128]) -> f64 {
     let idx = ((latencies.len() as f64 * percentile) as usize).saturating_sub(1);
     latencies[idx] as f64 / 1000.0
+}
+
+fn print_latency_metrics(label: &str, latencies: &mut Vec<u128>) {
+    if latencies.is_empty() {
+        return;
+    }
+    latencies.sort_unstable();
+    let p50 = calc_percentile(0.50, latencies);
+    let p95 = calc_percentile(0.95, latencies);
+    let p99 = calc_percentile(0.99, latencies);
+    println!("{label} requests: {}", latencies.len());
+    println!("  p50: {p50:.3} ms");
+    println!("  p95: {p95:.3} ms");
+    println!("  p99: {p99:.3} ms");
+}
+
+async fn check_consistency(
+    client: &reqwest_middleware::ClientWithMiddleware,
+    base_url: &str,
+    bar: &ProgressBar,
+    request_key: &str,
+    last_put: &(String, String),
+) -> Result<(), reqwest_middleware::Error> {
+    bar.println(format!(
+        "----- Request for key {request_key} took longer than 1 second, checking for data consistency -----"
+    ));
+    let (key, expected_value) = last_put;
+    let res = client.get(format!("{base_url}/{key}")).send().await?;
+    match res.status() {
+        StatusCode::OK => match res.text().await {
+            Ok(v) if v == *expected_value => {
+                bar.println(format!("Data consistency verified for key {key} after retry"));
+            }
+            Ok(v) => {
+                bar.println(format!(
+                    "Data inconsistency detected for key {key}: expected '{expected_value}', got '{v}'"
+                ));
+            }
+            Err(_) => {
+                bar.println(format!("Failed to retrieve value for key {key} after retry"));
+            }
+        },
+        status => {
+            bar.println(format!(
+                "Data inconsistency detected for key {key}: expected OK, got {status}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -55,7 +104,7 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
 
     let bar = ProgressBar::new(requests.len() as u64);
     let timer_all = Instant::now();
-    let mut last_successful_put_request: Option<Request> = None;
+    let mut last_successful_put: Option<(String, String)> = None;
     for request in &mut requests {
         let timer_request = Instant::now();
         let url = format!("{base_url}/{}", request.key);
@@ -63,69 +112,38 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
             let res = client.put(&url).body(request.value.clone()).send().await?;
             put_latencies.push(timer_request.elapsed().as_micros());
             request.success = res.status() == StatusCode::OK;
-            let msg = format!("PUT request successful: {}", request.success);
-            bar.println(msg);
+            if !request.success {
+                let msg = format!("PUT request failed with status: {}", res.status());
+                bar.println(msg);
+            }
         } else {
             let res = client.get(&url).send().await?;
             get_latencies.push(timer_request.elapsed().as_micros());
+            let result_status = res.status();
             if request.value == "NOT_FOUND" {
-                request.success = res.status() == StatusCode::NOT_FOUND;
+                request.success = result_status == StatusCode::NOT_FOUND;
             } else {
                 match res.text().await {
                     Ok(v) => request.success = request.value == v,
-                    Err(_) => request.success = false,
-                }
-            }
-            let msg = format!("GET request successful: {}", request.success);
-            bar.println(msg);
-        };
-
-        // If the request took longer than 1 second, we assume that the kv-store-engine might have been
-        // restarted during the request. We then if the last successful PUT before the restart has been stored correctly
-        if timer_request.elapsed().as_secs() > 1
-            && request.success
-            && let Some(last_put) = &last_successful_put_request
-        {
-            bar.println(format!(
-                "----- Request for key {} took longer than 1 second, checking for data consistency -----",
-                request.key
-            ));
-            let url = format!("{base_url}/{}", last_put.key);
-            let res = client.get(url).send().await?;
-            if res.status() == StatusCode::OK {
-                match res.text().await {
-                    Ok(v) => {
-                        if v != last_put.value {
-                            let msg = format!(
-                                "Data inconsistency detected for key {}: expected '{}', got '{}'",
-                                last_put.key, last_put.value, v
-                            );
-                            bar.println(msg);
-                        } else {
-                            let msg = format!(
-                                "Data consistency verified for key {} after retry",
-                                last_put.key
-                            );
-                            bar.println(msg);
-                        }
-                    }
                     Err(_) => {
-                        let msg = format!(
-                            "Failed to retrieve value for key {} after retry",
-                            last_put.key
-                        );
+                        request.success = false;
+                        let msg = format!("GET request failed with status: {}", result_status);
                         bar.println(msg);
                     }
                 }
             }
+        };
+
+        // If the request took longer than 1 second, we assume that the kv-storage-engine might have been
+        // restarted during the request. We then check if the last successful PUT before the restart has been stored correctly
+        if timer_request.elapsed().as_secs() > 1
+            && request.success
+            && let Some(last_put) = &last_successful_put
+        {
+            check_consistency(&client, base_url, &bar, &request.key, last_put).await?;
         }
         if request.success && request.method == "PUT" {
-            last_successful_put_request = Some(Request {
-                method: request.method.clone(),
-                key: request.key.clone(),
-                value: request.value.clone(),
-                success: request.success,
-            });
+            last_successful_put = Some((request.key.clone(), request.value.clone()));
         }
         bar.inc(1);
     }
@@ -138,30 +156,8 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
     let successful = requests.iter().filter(|r| r.success).count();
     println!("Successful requests: {successful}/{}", requests.len());
 
-    if !get_latencies.is_empty() {
-        get_latencies.sort_unstable();
-
-        let p50 = calc_percentile(0.50, &get_latencies);
-        let p95 = calc_percentile(0.95, &get_latencies);
-        let p99 = calc_percentile(0.99, &get_latencies);
-
-        println!("GET requests: {}", get_latencies.len());
-        println!("  p50: {:.3} ms", p50);
-        println!("  p95: {:.3} ms", p95);
-        println!("  p99: {:.3} ms", p99);
-    }
-
-    if !put_latencies.is_empty() {
-        put_latencies.sort_unstable();
-        let p50 = calc_percentile(0.50, &put_latencies);
-        let p95 = calc_percentile(0.95, &put_latencies);
-        let p99 = calc_percentile(0.99, &put_latencies);
-
-        println!("PUT requests: {}", put_latencies.len());
-        println!("  p50: {:.3} ms", p50);
-        println!("  p95: {:.3} ms", p95);
-        println!("  p99: {:.3} ms", p99);
-    }
+    print_latency_metrics("GET", &mut get_latencies);
+    print_latency_metrics("PUT", &mut put_latencies);
 
     Ok(())
 }
