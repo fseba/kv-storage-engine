@@ -10,10 +10,18 @@ use reqwest::StatusCode;
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
+const FILE_NAME: &str = "put-delete.txt";
+// const FILE_NAME: &str = "put.txt";
+
+enum Method {
+    Put(String),
+    Get(String),
+    Delete,
+}
+
 struct Request {
-    method: String,
+    method: Method,
     key: String,
-    value: String,
     success: bool,
 }
 
@@ -22,7 +30,7 @@ fn calc_percentile(percentile: f64, latencies: &[u128]) -> f64 {
     latencies[idx] as f64 / 1000.0
 }
 
-fn print_latency_metrics(label: &str, latencies: &mut Vec<u128>) {
+fn print_latency_metrics(label: &str, latencies: &mut [u128]) {
     if latencies.is_empty() {
         return;
     }
@@ -36,7 +44,7 @@ fn print_latency_metrics(label: &str, latencies: &mut Vec<u128>) {
     println!("  p99: {p99:.3} ms");
 }
 
-async fn check_consistency(
+async fn check_put_consistency(
     client: &reqwest_middleware::ClientWithMiddleware,
     base_url: &str,
     bar: &ProgressBar,
@@ -51,20 +59,51 @@ async fn check_consistency(
     match res.status() {
         StatusCode::OK => match res.text().await {
             Ok(v) if v == *expected_value => {
-                bar.println(format!("Data consistency verified for key {key} after retry"));
+                bar.println(format!(
+                    "PUT --- Data consistency verified for key {key} after retry"
+                ));
             }
             Ok(v) => {
                 bar.println(format!(
-                    "Data inconsistency detected for key {key}: expected '{expected_value}', got '{v}'"
+                    "PUT --- Data inconsistency detected for key {key}: expected '{expected_value}', got '{v}'"
                 ));
             }
             Err(_) => {
-                bar.println(format!("Failed to retrieve value for key {key} after retry"));
+                bar.println(format!(
+                    "PUT --- Failed to retrieve value for key {key} after retry"
+                ));
             }
         },
         status => {
             bar.println(format!(
-                "Data inconsistency detected for key {key}: expected OK, got {status}"
+                "PUT --- Data inconsistency detected for key {key}: expected OK, got {status}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn check_delete_consistency(
+    client: &reqwest_middleware::ClientWithMiddleware,
+    base_url: &str,
+    bar: &ProgressBar,
+    request_key: &str,
+    last_delete_key: &str,
+) -> Result<(), reqwest_middleware::Error> {
+    bar.println(format!(
+        "----- Request for key {request_key} took longer than 1 second, checking for data consistency -----"
+    ));
+    let res = client
+        .get(format!("{base_url}/{last_delete_key}"))
+        .send()
+        .await?;
+    match res.status() {
+        StatusCode::NOT_FOUND => bar.println(format!(
+            "DELETE --- Data consistency verified for key {last_delete_key} after retry"
+        )),
+        status => {
+            bar.println(format!(
+                "DELETE --- Data inconsistency detected for key {last_delete_key}: expected NOT_FOUND, got {status}"
             ));
         }
     }
@@ -73,22 +112,26 @@ async fn check_consistency(
 
 #[tokio::main]
 async fn main() -> Result<(), reqwest_middleware::Error> {
-    let file = BufReader::new(File::open("put.txt").unwrap());
+    let file = BufReader::new(File::open(FILE_NAME).unwrap());
     let mut requests: Vec<Request> = file
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 3 {
-                Some(Request {
-                    method: parts[0].to_string(),
-                    key: parts[1].to_string(),
-                    value: parts[2].to_string(),
-                    success: false,
-                })
-            } else {
-                None
-            }
+            if parts.len() < 2 {
+                return None;
+            };
+            Some(Request {
+                method: match parts[0] {
+                    "PUT" | "GET" if parts.len() < 3 => return None,
+                    "PUT" => Method::Put(parts[2].to_string()),
+                    "GET" => Method::Get(parts[2].to_string()),
+                    "DELETE" => Method::Delete,
+                    _ => return None,
+                },
+                key: parts[1].to_string(),
+                success: false,
+            })
         })
         .collect();
 
@@ -101,49 +144,78 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
     let base_url = "http://127.0.0.1:8080";
     let mut get_latencies: Vec<u128> = Vec::new();
     let mut put_latencies: Vec<u128> = Vec::new();
+    let mut delete_latencies: Vec<u128> = Vec::new();
 
     let bar = ProgressBar::new(requests.len() as u64);
+    let msg = format!("{} loaded, starting requests...", FILE_NAME);
+    bar.println(msg);
     let timer_all = Instant::now();
+
     let mut last_successful_put: Option<(String, String)> = None;
+    let mut last_successful_delete: Option<String> = None;
+
     for request in &mut requests {
         let timer_request = Instant::now();
         let url = format!("{base_url}/{}", request.key);
-        if request.method == "PUT" {
-            let res = client.put(&url).body(request.value.clone()).send().await?;
-            put_latencies.push(timer_request.elapsed().as_micros());
-            request.success = res.status() == StatusCode::OK;
-            if !request.success {
-                let msg = format!("PUT request failed with status: {}", res.status());
-                bar.println(msg);
+        match &request.method {
+            Method::Put(value) => {
+                let res = client.put(&url).body(value.clone()).send().await?;
+                put_latencies.push(timer_request.elapsed().as_micros());
+                request.success = res.status() == StatusCode::OK;
+                if !request.success {
+                    let msg = format!("PUT request failed with status: {}", res.status());
+                    bar.println(msg);
+                }
             }
-        } else {
-            let res = client.get(&url).send().await?;
-            get_latencies.push(timer_request.elapsed().as_micros());
-            let result_status = res.status();
-            if request.value == "NOT_FOUND" {
-                request.success = result_status == StatusCode::NOT_FOUND;
-            } else {
-                match res.text().await {
-                    Ok(v) => request.success = request.value == v,
-                    Err(_) => {
-                        request.success = false;
-                        let msg = format!("GET request failed with status: {}", result_status);
-                        bar.println(msg);
+            Method::Get(expected) => {
+                let res = client.get(&url).send().await?;
+                get_latencies.push(timer_request.elapsed().as_micros());
+                let result_status = res.status();
+                if expected == "NOT_FOUND" {
+                    request.success = result_status == StatusCode::NOT_FOUND;
+                } else {
+                    match res.text().await {
+                        Ok(v) => request.success = *expected == v,
+                        Err(_) => {
+                            request.success = false;
+                            let msg = format!("GET request failed with status: {}", result_status);
+                            bar.println(msg);
+                        }
                     }
                 }
             }
-        };
+            Method::Delete => {
+                let res = client.delete(&url).send().await?;
+                delete_latencies.push(timer_request.elapsed().as_micros());
+                request.success = res.status() == StatusCode::ACCEPTED;
+                if !request.success {
+                    let msg = format!("DELETE request failed with status: {}", res.status());
+                    bar.println(msg);
+                }
+            }
+        }
 
         // If the request took longer than 1 second, we assume that the kv-storage-engine might have been
         // restarted during the request. We then check if the last successful PUT before the restart has been stored correctly
-        if timer_request.elapsed().as_secs() > 1
-            && request.success
-            && let Some(last_put) = &last_successful_put
-        {
-            check_consistency(&client, base_url, &bar, &request.key, last_put).await?;
+        if timer_request.elapsed().as_secs() > 1 && request.success {
+            if let Some(last_put) = &last_successful_put {
+                check_put_consistency(&client, base_url, &bar, &request.key, last_put).await?;
+            }
+
+            if let Some(last_delete) = &last_successful_delete {
+                check_delete_consistency(&client, base_url, &bar, &request.key, last_delete)
+                    .await?;
+            }
         }
-        if request.success && request.method == "PUT" {
-            last_successful_put = Some((request.key.clone(), request.value.clone()));
+
+        if request.success {
+            match &request.method {
+                Method::Put(value) => {
+                    last_successful_put = Some((request.key.clone(), value.clone()))
+                }
+                Method::Get(_) => (),
+                Method::Delete => last_successful_delete = Some(request.key.clone()),
+            }
         }
         bar.inc(1);
     }
@@ -158,6 +230,7 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
 
     print_latency_metrics("GET", &mut get_latencies);
     print_latency_metrics("PUT", &mut put_latencies);
+    print_latency_metrics("DELETE", &mut delete_latencies);
 
     Ok(())
 }
