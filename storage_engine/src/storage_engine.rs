@@ -35,10 +35,16 @@ const WAL: &str = "wal.db";
 /// ```
 #[derive(Debug)]
 pub struct StorageEngine {
-    memtable: HashMap<String, String>,
+    memtable: HashMap<String, MemtableEntry>,
     directory_path: PathBuf,
     sst_file_counter: usize,
     negative_cache: LRUCache,
+}
+
+#[derive(Debug)]
+enum MemtableEntry {
+    Value(String),
+    Deleted,
 }
 
 impl StorageEngine {
@@ -83,7 +89,12 @@ impl StorageEngine {
             for wal_entry in wal.lines() {
                 if let Ok(record) = serde_json::from_str::<WALRecord>(wal_entry) {
                     match record.op {
-                        WALRecordType::Put => engine.memtable.insert(record.key, record.value),
+                        WALRecordType::Put(v) => {
+                            engine.memtable.insert(record.key, MemtableEntry::Value(v))
+                        }
+                        WALRecordType::Delete => {
+                            engine.memtable.insert(record.key, MemtableEntry::Deleted)
+                        }
                     };
                 }
                 if engine.memtable.len() >= MAX_ENTRIES {
@@ -125,18 +136,17 @@ impl StorageEngine {
     /// flushing the memtable to disk fails when the entry threshold is reached.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let wal_record = WALRecord {
-            op: WALRecordType::Put,
+            op: WALRecordType::Put(value.clone()),
             key: key.clone(),
-            value: value.clone(),
         };
         let mut wal = File::options()
             .append(true)
             .open(self.directory_path.join(WAL))?;
-        writeln!(wal, "{}", serde_json::to_string(&wal_record)?)?;
+        writeln!(wal, "{}", json!(&wal_record))?;
         wal.sync_data()?;
 
         self.negative_cache.remove(&key);
-        self.memtable.insert(key, value);
+        self.memtable.insert(key, MemtableEntry::Value(value));
         if self.memtable.len() >= MAX_ENTRIES {
             self.flush()?;
         }
@@ -163,8 +173,10 @@ impl StorageEngine {
     /// assert_eq!(engine.get("key2"), None);
     /// ```
     pub fn get(&mut self, key: &str) -> Option<String> {
-        if let Some(value) = self.memtable.get(key) {
-            return Some(value.clone());
+        match self.memtable.get(key) {
+            Some(MemtableEntry::Value(value)) => return Some(value.clone()),
+            Some(MemtableEntry::Deleted) => return None,
+            None => {}
         }
         if self.negative_cache.contains(key) {
             return None;
@@ -173,11 +185,19 @@ impl StorageEngine {
         for n in (1..=self.sst_file_counter).rev() {
             let sst_file = format!("sst-{n}.json");
             if let Ok(file) = File::open(self.directory_path.join(sst_file)) {
-                let value = serde_json::from_reader::<_, Vec<Value>>(BufReader::new(file))
-                    .ok()?
-                    .iter()
-                    .filter_map(|entry| entry.as_object())
-                    .find_map(|obj| obj.get(key).and_then(|v| v.as_str().map(|s| s.to_string())));
+                let Some(entries) =
+                    serde_json::from_reader::<_, Vec<Value>>(BufReader::new(file)).ok()
+                else {
+                    continue;
+                };
+
+                let value = entries.iter().find_map(|obj| {
+                    if obj["key"].as_str() == Some(key) {
+                        obj["value"].as_str().map(|v| v.to_string())
+                    } else {
+                        None
+                    }
+                });
                 if value.is_some() {
                     return value;
                 }
@@ -185,6 +205,23 @@ impl StorageEngine {
         }
         self.negative_cache.insert(key.to_string());
         None
+    }
+
+    pub fn delete(&mut self, key: &str) -> Result<()> {
+        let wal_record = WALRecord {
+            key: key.to_string(),
+            op: WALRecordType::Delete,
+        };
+        let mut wal = File::options()
+            .append(true)
+            .open(self.directory_path.join(WAL))?;
+        writeln!(wal, "{}", serde_json::to_string(&wal_record)?)?;
+        wal.sync_data()?;
+
+        self.negative_cache.insert(key.to_string());
+        self.memtable
+            .insert(key.to_string(), MemtableEntry::Deleted);
+        Ok(())
     }
 
     /// Flushes the in-memory key-value pairs to disk as a sorted JSON array.
@@ -231,7 +268,7 @@ impl StorageEngine {
     }
 
     fn create_flush_content(&self) -> Value {
-        let mut entries: Vec<(&String, &String)> = self.memtable.iter().collect();
+        let mut entries: Vec<(&String, &MemtableEntry)> = self.memtable.iter().collect();
         entries.sort_by_key(|(k, _)| *k);
         let json_flush: Value = entries
             .iter()
@@ -248,6 +285,7 @@ impl StorageEngine {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct WALRecord {
+    key: String,
     op: WALRecordType,
     key: String,
     value: String,
@@ -255,7 +293,8 @@ struct WALRecord {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 enum WALRecordType {
-    Put,
+    Put(String),
+    Delete,
 }
 
 fn parse_sst_filename(filename: &str) -> Option<usize> {
@@ -387,7 +426,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
         engine.memtable = (0..1999u32)
-            .map(|i| (format!("key_{i}"), format!("value_{i}")))
+            .map(|i| {
+                (
+                    format!("key_{i}"),
+                    MemtableEntry::Value("value_{i}".to_string()),
+                )
+            })
             .collect();
 
         engine
@@ -405,14 +449,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
         engine.memtable = HashMap::from([
-            ("b".to_string(), "v_2".to_string()),
-            ("c".to_string(), "v_3".to_string()),
-            ("a".to_string(), "v_1".to_string()),
+            ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
+            ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
+            ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
         ]);
 
         engine.flush().unwrap();
         let content = fs::read_to_string(dir.path().join("sst-1.json")).unwrap();
-        assert_eq!(content, "[{\"a\":\"v_1\"},{\"b\":\"v_2\"},{\"c\":\"v_3\"}]");
+        assert_eq!(
+            content,
+            "[{\"key\":\"a\",\"value\":\"v_1\"},{\"key\":\"b\",\"value\":\"v_2\"},{\"key\":\"c\",\"value\":\"v_3\"}]"
+        );
     }
 
     #[test]
@@ -420,9 +467,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
         engine.memtable = HashMap::from([
-            ("a".to_string(), "v_1".to_string()),
-            ("b".to_string(), "v_2".to_string()),
-            ("c".to_string(), "v_3".to_string()),
+            ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
+            ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
+            ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
         ]);
 
         engine.flush().unwrap();
@@ -442,9 +489,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
         engine.memtable = HashMap::from([
-            ("a".to_string(), "v_1".to_string()),
-            ("b".to_string(), "v_2".to_string()),
-            ("c".to_string(), "v_3".to_string()),
+            ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
+            ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
+            ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
         ]);
         engine.directory_path = PathBuf::from("/non/existent/directory");
 
@@ -465,9 +512,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
         engine.memtable = HashMap::from([
-            ("a".to_string(), "v_1".to_string()),
-            ("b".to_string(), "v_2".to_string()),
-            ("c".to_string(), "v_3".to_string()),
+            ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
+            ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
+            ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
         ]);
 
         engine.flush().unwrap();
@@ -482,9 +529,9 @@ mod tests {
     fn failed_flush_should_not_increase_counter() {
         let mut engine = StorageEngine {
             memtable: HashMap::from([
-                ("a".to_string(), "v_1".to_string()),
-                ("b".to_string(), "v_2".to_string()),
-                ("c".to_string(), "v_3".to_string()),
+                ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
+                ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
+                ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
             ]),
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
@@ -568,9 +615,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join(WAL);
         let wal_record = WALRecord {
-            op: WALRecordType::Put,
+            op: WALRecordType::Put("value1".to_string()),
             key: "key1".to_string(),
-            value: "value1".to_string(),
         };
         let wal_content = serde_json::to_string(&wal_record).unwrap();
         fs::write(wal_path, wal_content + "\n").unwrap();

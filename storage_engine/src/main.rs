@@ -9,7 +9,7 @@ use axum::{
     Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, put},
+    routing::{delete, get, put},
 };
 
 use storage_engine::StorageEngine;
@@ -22,6 +22,7 @@ async fn main() -> io::Result<()> {
     let app = Router::new()
         .route("/{key}", get(get_value))
         .route("/{key}", put(set_value))
+        .route("/{key}", delete(delete_value))
         .with_state(engine);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
@@ -35,10 +36,9 @@ async fn get_value(
     engine: State<Arc<Mutex<StorageEngine>>>,
     Path(key): Path<String>,
 ) -> Result<String, StatusCode> {
-    if let Some(v) = engine.lock().expect("mutex was poisoned").get(&key) {
-        Ok(v)
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    match engine.lock().expect("mutex was poisoned").get(&key) {
+        Some(v) => Ok(v),
+        None => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -51,6 +51,20 @@ async fn set_value(
     println!("Storing key: {} with value: {}", &key, &body);
     match engine.lock().expect("mutex was poisoned").set(key, body) {
         Ok(_) => StatusCode::OK,
+        Err(e) => {
+            eprintln!("Error setting value: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_value(
+    engine: State<Arc<Mutex<StorageEngine>>>,
+    Path(key): Path<String>,
+) -> StatusCode {
+    println!("Deleted key: {}", &key);
+    match engine.lock().expect("mutex was poisoned").delete(&key) {
+        Ok(_) => StatusCode::ACCEPTED,
         Err(e) => {
             eprintln!("Error setting value: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
