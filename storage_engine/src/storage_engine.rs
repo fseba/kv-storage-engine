@@ -1,7 +1,9 @@
 use std::{
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, BufWriter, Result, Write},
+    io::{BufReader, BufWriter, Read, Result, Write},
+    ops::Not,
     path::{Path, PathBuf},
 };
 
@@ -15,6 +17,7 @@ const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TEMP: &str = "MANIFEST.tmp";
 const WAL: &str = "wal.db";
+const COMPACTION_TRIGGER_COUNT: usize = 10000;
 
 /// An in-memory key-value storage engine backed by SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
@@ -39,6 +42,7 @@ pub struct StorageEngine {
     directory_path: PathBuf,
     sst_file_counter: usize,
     negative_cache: LRUCache,
+    update_counter: usize,
 }
 
 #[derive(Debug)]
@@ -69,6 +73,7 @@ impl StorageEngine {
             directory_path: path.as_ref().to_path_buf(),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
+            update_counter: 0,
         };
 
         let manifest_path = engine.directory_path.join(MANIFEST);
@@ -98,7 +103,8 @@ impl StorageEngine {
                     };
                 }
                 if engine.memtable.len() >= MAX_ENTRIES {
-                    engine.flush()?;
+                    let flush_content = engine.create_flush_content();
+                    engine.flush(flush_content)?;
                 }
             }
         } else {
@@ -148,7 +154,12 @@ impl StorageEngine {
         self.negative_cache.remove(&key);
         self.memtable.insert(key, MemtableEntry::Value(value));
         if self.memtable.len() >= MAX_ENTRIES {
-            self.flush()?;
+            let flush_content = self.create_flush_content();
+            self.flush(flush_content)?;
+        }
+        self.update_counter += 1;
+        if self.update_counter.is_multiple_of(COMPACTION_TRIGGER_COUNT) {
+            self.compact_sst_files()?;
         }
         Ok(())
     }
@@ -221,6 +232,10 @@ impl StorageEngine {
         self.negative_cache.insert(key.to_string());
         self.memtable
             .insert(key.to_string(), MemtableEntry::Deleted);
+        self.update_counter += 1;
+        if self.update_counter.is_multiple_of(COMPACTION_TRIGGER_COUNT) {
+            self.compact_sst_files()?;
+        }
         Ok(())
     }
 
@@ -232,16 +247,15 @@ impl StorageEngine {
     /// # Errors
     /// Returns an `io::Error` if there is an issue creating, writing, or syncing
     /// any of the SST, manifest, or WAL files.
-    fn flush(&mut self) -> Result<()> {
-        let tmp_count = self.sst_file_counter + 1;
-        let sst_file_name = format!("sst-{tmp_count}.json");
-        // INFO: Truncates file
-        let sst_file = File::create(self.directory_path.join(&sst_file_name))?;
-        let flush_content = self.create_flush_content();
-        serde_json::to_writer(BufWriter::new(&sst_file), &flush_content)?;
-        sst_file.sync_data()?;
+    fn flush(&mut self, flush_content: Value) -> Result<()> {
+        self.write_sst_file(flush_content)?;
+        // Clear the WAL after a successful flush
+        File::create(self.directory_path.join(WAL))?.sync_data()?;
+        self.memtable.clear();
+        Ok(())
+    }
 
-        // Update the manifest with the new SST file name
+    fn update_manifest(&mut self, sst_file_name: String) -> Result<()> {
         let mut manifest_content = fs::read(self.directory_path.join(MANIFEST))?;
         writeln!(manifest_content, "{}", sst_file_name)?;
         let mut manifest_temp = File::options()
@@ -258,12 +272,6 @@ impl StorageEngine {
         let manifest = File::open(self.directory_path.join(MANIFEST))?;
         manifest.sync_data()?;
         self.sync_parent_dir()?;
-
-        // Clear the WAL after a successful flush
-        File::create(self.directory_path.join(WAL))?.sync_data()?;
-
-        self.sst_file_counter += 1;
-        self.memtable.clear();
         Ok(())
     }
 
@@ -273,22 +281,162 @@ impl StorageEngine {
         let json_flush: Value = entries
             .iter()
             .take(MAX_ENTRIES)
-            .map(|(k, v)| {
-                let key = k.to_string();
-                let value = v.to_string();
-                json!({key: value})
+            .map(|(k, e)| match e {
+                MemtableEntry::Value(v) => {
+                    json!(SSTEntry {
+                        key: k.to_string(),
+                        value: Some(v.to_string()),
+                        deleted: false,
+                    })
+                }
+                MemtableEntry::Deleted => {
+                    json!(SSTEntry {
+                        key: k.to_string(),
+                        value: None,
+                        deleted: true,
+                    })
+                }
             })
             .collect();
         json_flush
     }
+
+    // TODO: Write tests
+    fn compact_sst_files(&mut self) -> Result<()> {
+        println!("Starting compaction...");
+        let mut min_heap = BinaryHeap::new();
+        let manifest_path = self.directory_path.join(MANIFEST);
+        if !manifest_path.exists() {
+            eprintln!("Manifest file not found, skipping compaction.");
+            return Ok(());
+        }
+
+        let old_manifest_content = fs::read_to_string(&manifest_path)?;
+        let content_clone = old_manifest_content.clone();
+        let sst_file_names = content_clone.lines().rev();
+        let mut file_iters = Vec::new();
+        for file_name in sst_file_names {
+            let file = File::open(self.directory_path.join(file_name))?;
+            let reader = BufReader::new(file);
+            let file_iter = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
+                .into_iter()
+                .peekable();
+            file_iters.push(file_iter);
+        }
+
+        let mut sst_entries = Vec::with_capacity(MAX_ENTRIES);
+        for (file_index, file_iter) in file_iters.iter_mut().enumerate() {
+            if let Some(entry) = file_iter.peek() {
+                min_heap.push(Reverse((
+                    entry.key.clone(),
+                    file_index,
+                    entry.value.clone(),
+                )));
+            }
+        }
+        while file_iters.iter_mut().any(|iter| iter.peek().is_some()) {
+            let Reverse((key, _file_index, value)) = min_heap.pop().unwrap();
+            min_heap.retain(|x| x.0.0 != key);
+            if value.is_some() {
+                let sst_entry = SSTEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    deleted: false,
+                };
+                sst_entries.push(sst_entry);
+                self.negative_cache.remove(&key);
+            }
+            if sst_entries.len() >= MAX_ENTRIES {
+                let content = json!(sst_entries);
+                self.write_sst_file(content)?;
+                sst_entries.clear();
+            }
+            for (file_index, iter) in file_iters.iter_mut().enumerate() {
+                if let Some(entry) = iter.peek()
+                    && entry.key == key
+                {
+                    iter.next();
+                    if let Some(next_entry) = iter.peek() {
+                        min_heap.push(Reverse((
+                            next_entry.key.clone(),
+                            file_index,
+                            next_entry.value.clone(),
+                        )));
+                    }
+                }
+            }
+        }
+        if !sst_entries.is_empty() {
+            let content = json!(sst_entries);
+            self.write_sst_file(content)?;
+            sst_entries.clear();
+        }
+
+        // INFO: Clean up section
+        let mut manifest_content = String::new();
+        {
+            let mut manifest_file = File::open(&manifest_path)?;
+            manifest_file.read_to_string(&mut manifest_content)?;
+        }
+
+        let old_lines: HashSet<&str> = old_manifest_content.lines().collect();
+        manifest_content = manifest_content
+            .lines()
+            .filter(|line| !old_lines.contains(*line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !manifest_content.is_empty() {
+            manifest_content.push('\n');
+        }
+
+        {
+            let mut manifest_temp = File::options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(self.directory_path.join(MANIFEST_TEMP))?;
+            manifest_temp.write_all(manifest_content.as_bytes())?;
+            manifest_temp.sync_data()?;
+        }
+        fs::rename(self.directory_path.join(MANIFEST_TEMP), &manifest_path)?;
+        let manifest = File::open(&manifest_path)?;
+        manifest.sync_data()?;
+        self.sync_parent_dir()?;
+        for line in old_lines {
+            fs::remove_file(self.directory_path.join(line))?
+        }
+        self.sync_parent_dir()?;
+
+        println!("Compaction complete.");
+        Ok(())
+    }
+
+    fn write_sst_file(&mut self, sst_entries: Value) -> Result<()> {
+        let tmp_count = self.sst_file_counter + 1;
+        let sst_file_name = format!("sst-{tmp_count}.json");
+        // INFO: Truncates file
+        let sst_file = File::create(self.directory_path.join(&sst_file_name))?;
+        serde_json::to_writer(BufWriter::new(&sst_file), &sst_entries)?;
+        sst_file.sync_data()?;
+        self.update_manifest(sst_file_name)?;
+        self.sst_file_counter += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SSTEntry {
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "<&bool>::not", default)]
+    deleted: bool,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct WALRecord {
     key: String,
     op: WALRecordType,
-    key: String,
-    value: String,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -403,7 +551,8 @@ mod tests {
         engine
             .set("key1".to_string(), "value1".to_string())
             .unwrap();
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
 
         assert_eq!(engine.get("key1"), Some("value1".to_string()));
     }
@@ -416,7 +565,8 @@ mod tests {
         engine
             .set("key1".to_string(), "value1".to_string())
             .unwrap();
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
 
         assert_eq!(engine.get("nonexistent"), None);
     }
@@ -454,7 +604,8 @@ mod tests {
             ("a".to_string(), MemtableEntry::Value("v_1".to_string())),
         ]);
 
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
         let content = fs::read_to_string(dir.path().join("sst-1.json")).unwrap();
         assert_eq!(
             content,
@@ -472,7 +623,8 @@ mod tests {
             ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
         ]);
 
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
 
         assert!(
             fs::exists(dir.path().join("sst-1.json")).unwrap(),
@@ -495,7 +647,8 @@ mod tests {
         ]);
         engine.directory_path = PathBuf::from("/non/existent/directory");
 
-        let result = engine.flush();
+        let flush_content = engine.create_flush_content();
+        let result = engine.flush(flush_content);
 
         assert!(
             result.is_err(),
@@ -517,9 +670,12 @@ mod tests {
             ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
         ]);
 
-        engine.flush().unwrap();
-        engine.flush().unwrap();
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
         assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
         assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
         assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
@@ -536,9 +692,11 @@ mod tests {
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
+            update_counter: 0,
         };
 
-        let result = engine.flush();
+        let flush_content = engine.create_flush_content();
+        let result = engine.flush(flush_content);
 
         assert!(
             result.is_err(),
@@ -583,8 +741,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
 
-        engine.flush().unwrap();
-        engine.flush().unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
 
         let manifest_content = fs::read_to_string(dir.path().join(MANIFEST)).unwrap();
         assert_eq!(
@@ -624,5 +784,53 @@ mod tests {
         let mut engine = StorageEngine::new(dir.path()).unwrap();
 
         assert_eq!(engine.get("key1"), Some("value1".to_string()));
+    }
+
+    #[test]
+    fn compact_sst_files_keeps_newest_record() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_2".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
+
+        engine.compact_sst_files().unwrap();
+
+        assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
+        assert_eq!(engine.get("aaa0").unwrap(), "value_2".to_string());
+        assert_eq!(engine.get("aaa100").unwrap(), "value_2".to_string());
+    }
+
+    #[test]
+    fn compact_sst_files_drops_tombstones() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
+        engine.delete("aaa0").unwrap();
+        for i in 1..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_2".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
+
+        engine.compact_sst_files().unwrap();
+
+        assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
+        assert!(engine.get("aaa0").is_none());
     }
 }

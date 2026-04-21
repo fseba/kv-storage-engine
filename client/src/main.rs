@@ -13,12 +13,14 @@ use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 const FILE_NAME: &str = "put-delete.txt";
 // const FILE_NAME: &str = "put.txt";
 
+#[derive(Debug)]
 enum Method {
     Put(String),
     Get(String),
     Delete,
 }
 
+#[derive(Debug)]
 struct Request {
     method: Method,
     key: String,
@@ -147,8 +149,8 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
     let mut delete_latencies: Vec<u128> = Vec::new();
 
     let bar = ProgressBar::new(requests.len() as u64);
-    let msg = format!("{} loaded, starting requests...", FILE_NAME);
-    bar.println(msg);
+    // let msg = format!("{} loaded, starting requests...", FILE_NAME);
+    // bar.println(msg);
     let timer_all = Instant::now();
 
     let mut last_successful_put: Option<(String, String)> = None;
@@ -173,9 +175,25 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
                 let result_status = res.status();
                 if expected == "NOT_FOUND" {
                     request.success = result_status == StatusCode::NOT_FOUND;
+                    if !request.success {
+                        let msg = format!(
+                            "GET request failed with status: {} - expected 'not_found'",
+                            result_status
+                        );
+                        bar.println(msg);
+                    }
                 } else {
                     match res.text().await {
-                        Ok(v) => request.success = *expected == v,
+                        Ok(v) => {
+                            request.success = *expected == v;
+                            if !request.success {
+                                let msg = format!(
+                                    "GET request failed with status: {} - expected {}, got {}",
+                                    result_status, *expected, v
+                                );
+                                bar.println(msg);
+                            }
+                        }
                         Err(_) => {
                             request.success = false;
                             let msg = format!("GET request failed with status: {}", result_status);
@@ -227,6 +245,10 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
 
     let successful = requests.iter().filter(|r| r.success).count();
     println!("Successful requests: {successful}/{}", requests.len());
+    let failed = requests.iter().filter(|r| !r.success);
+    for (i, fail) in failed.enumerate() {
+        println!("#{i}: {:?}", fail);
+    }
 
     print_latency_metrics("GET", &mut get_latencies);
     print_latency_metrics("PUT", &mut put_latencies);

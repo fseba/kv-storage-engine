@@ -48,7 +48,7 @@ async fn set_value(
     Path(key): Path<String>,
     body: String,
 ) -> StatusCode {
-    println!("Storing key: {} with value: {}", &key, &body);
+    // println!("Storing key: {} with value: {}", &key, &body);
     match engine.lock().expect("mutex was poisoned").set(key, body) {
         Ok(_) => StatusCode::OK,
         Err(e) => {
@@ -62,7 +62,7 @@ async fn delete_value(
     engine: State<Arc<Mutex<StorageEngine>>>,
     Path(key): Path<String>,
 ) -> StatusCode {
-    println!("Deleted key: {}", &key);
+    // println!("Deleted key: {}", &key);
     match engine.lock().expect("mutex was poisoned").delete(&key) {
         Ok(_) => StatusCode::ACCEPTED,
         Err(e) => {
