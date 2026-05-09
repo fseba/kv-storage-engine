@@ -197,20 +197,19 @@ impl StorageEngine {
             let sst_file = format!("sst-{n}.json");
             if let Ok(file) = File::open(self.directory_path.join(sst_file)) {
                 let Some(entries) =
-                    serde_json::from_reader::<_, Vec<Value>>(BufReader::new(file)).ok()
+                    serde_json::from_reader::<_, Vec<SSTEntry>>(BufReader::new(file)).ok()
                 else {
                     continue;
                 };
 
-                let value = entries.iter().find_map(|obj| {
-                    if obj["key"].as_str() == Some(key) {
-                        obj["value"].as_str().map(|v| v.to_string())
-                    } else {
-                        None
+                let entry = entries.iter().find(|entry| entry.key == key);
+                match entry {
+                    Some(SSTEntry { value: Some(v), .. }) => return Some(v.clone()),
+                    Some(SSTEntry { deleted: true, .. }) => {
+                        self.negative_cache.insert(key.to_string());
+                        return None;
                     }
-                });
-                if value.is_some() {
-                    return value;
+                    _ => {}
                 }
             }
         }
