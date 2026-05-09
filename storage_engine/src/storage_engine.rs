@@ -300,7 +300,6 @@ impl StorageEngine {
         json_flush
     }
 
-    // TODO: Write tests
     fn compact_sst_files(&mut self) -> Result<()> {
         println!("Starting compaction...");
         let mut min_heap = BinaryHeap::new();
@@ -311,8 +310,7 @@ impl StorageEngine {
         }
 
         let old_manifest_content = fs::read_to_string(&manifest_path)?;
-        let content_clone = old_manifest_content.clone();
-        let sst_file_names = content_clone.lines().rev();
+        let sst_file_names = old_manifest_content.lines().rev();
         let mut file_iters = Vec::new();
         for file_name in sst_file_names {
             let file = File::open(self.directory_path.join(file_name))?;
@@ -333,8 +331,7 @@ impl StorageEngine {
                 )));
             }
         }
-        while file_iters.iter_mut().any(|iter| iter.peek().is_some()) {
-            let Reverse((key, _file_index, value)) = min_heap.pop().unwrap();
+        while let Some(Reverse((key, _file_index, value))) = min_heap.pop() {
             min_heap.retain(|x| x.0.0 != key);
             if value.is_some() {
                 let sst_entry = SSTEntry {
