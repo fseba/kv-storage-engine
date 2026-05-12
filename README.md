@@ -16,18 +16,20 @@ This project implements a key-value storage engine in Rust. Based on [Build Your
 The `StorageEngine` struct provides the core key-value storage functionality:
 
 - **WAL**: Every write is first appended to a write-ahead log (`wal.db`) and synced to disk for durability. On startup, unflushed WAL entries are replayed into the memtable to recover the last session
-- **Memtable**: Writes are buffered in an in-memory `HashMap<String, String>` for fast key-value operations
-- **SST files**: When the memtable reaches 2000 entries, it is flushed to a sorted JSON SST file on disk and the WAL is cleared
-- **Manifest**: Tracks all SST files written; updated atomically via a temp file rename on each flush
-- **Negative cache**: An LRU cache of recently queried missing keys to avoid redundant SST scans
+- **Memtable**: Writes are buffered in an in-memory `HashMap<String, MemtableEntry>` for fast key-value operations. Deletions are represented as tombstones (`MemtableEntry::Deleted`) rather than immediate removals
+- **SST files**: When the memtable reaches 2000 entries, it is flushed to a sorted JSON SST file on disk and the WAL is cleared. Tombstones are written to SST files so deletions survive a restart
+- **Compaction**: Every 10,000 writes, all existing SST files are merged into a minimal set of new files. Duplicate keys are resolved by keeping the newest value; tombstones are dropped entirely. Old SST files are removed and the manifest is updated atomically
+- **Manifest**: Tracks all SST files written; updated atomically via a temp file rename on each flush and compaction
+- **Negative cache**: An LRU cache of recently queried absent or deleted keys to avoid redundant SST scans
 - **Thread-safe access**: Wrapped in `Arc<Mutex<>>` for concurrent access across HTTP handlers
-- **Simple interface**: Provides `get()` and `set()` methods for basic operations
+- **Simple interface**: Provides `get()`, `set()`, and `delete()` methods for basic operations
 
 #### Methods
 
 - `new(path)` - Creates a storage engine rooted at `path`, recovering the SST counter from the manifest and replaying any unflushed WAL entries into the memtable
 - `set(key: String, value: String) -> Result<()>` - Appends to the WAL, inserts into the memtable, and flushes to disk if the memtable is full
-- `get(key: &str) -> Option<String>` - Retrieves a value by key; checks memtable, negative cache, then SST files
+- `get(key: &str) -> Option<String>` - Retrieves a value by key; checks memtable, negative cache, then SST files. Returns `None` for missing or deleted keys
+- `delete(key: &str) -> Result<()>` - Appends a delete record to the WAL and inserts a tombstone into the memtable
 
 ### HTTP API
 
@@ -57,6 +59,18 @@ Sets or updates the value for the given key.
 curl -X PUT http://127.0.0.1:8080/mykey \
   -H "Content-Type: text/plain" \
   -d 'Hello, World!'
+```
+
+#### DELETE /{key}
+Marks the given key as deleted.
+
+**Response:**
+- `202 Accepted` - Key successfully deleted
+- `500 Internal Server Error` - Failed to write to WAL
+
+**Example:**
+```bash
+curl -X DELETE http://127.0.0.1:8080/mykey
 ```
 
 ## Usage

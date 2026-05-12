@@ -115,8 +115,8 @@ impl StorageEngine {
         Ok(engine)
     }
 
-    /// Ensures that the parent directory of the storage engine is synced to disk.
-    /// Use after creating a new file.
+    /// Syncs the storage directory to disk, making any recently created directory
+    /// entries durable. Call this after creating a new file in the storage directory.
     /// # Errors
     /// Returns an `io::Error` if there is an issue opening or syncing the directory.
     fn sync_parent_dir(&self) -> Result<()> {
@@ -168,11 +168,11 @@ impl StorageEngine {
     /// Checks the in-memory memtable first, then the negative cache (keys confirmed absent).
     /// If not found in either, performs a linear scan across SST files from newest to oldest.
     /// On a miss, the key is added to the negative cache to skip SST scans on future lookups.
-    /// Returns `None` if the key is not found anywhere.
+    /// Returns `None` if the key does not exist or has been deleted.
     /// # Arguments
     /// * `key` - The key to look up
     /// # Returns
-    /// An `Option<String>` containing the value if found, or `None` if the key doesn't exist.
+    /// `Some(value)` if the key exists and has not been deleted, otherwise `None`.
     /// # Examples
     /// ```
     /// use storage_engine::StorageEngine;
@@ -217,6 +217,16 @@ impl StorageEngine {
         None
     }
 
+    /// Marks a key as deleted in the storage engine.
+    /// Appends a delete record to the WAL for durability, inserts a tombstone into
+    /// the memtable, and adds the key to the negative cache so future lookups return
+    /// immediately without scanning SST files. The deletion is persisted to SST during
+    /// the next flush; tombstones are dropped entirely during compaction.
+    /// # Arguments
+    /// * `key` - The key to delete
+    /// # Errors
+    /// Returns an `io::Error` if the WAL cannot be written or synced, or if
+    /// compaction triggered by the update count fails.
     pub fn delete(&mut self, key: &str) -> Result<()> {
         let wal_record = WALRecord {
             key: key.to_string(),
@@ -238,11 +248,10 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flushes the in-memory key-value pairs to disk as a sorted JSON array.
-    /// The key-value pairs are written to a file named `sst-{N}.json` (where N
-    /// is an incrementing counter) in the configured directory. The manifest is
-    /// updated atomically via a temp file rename. After a successful flush, the
-    /// WAL is cleared, the memtable is cleared, and the counter is incremented.
+    /// Writes pre-serialized memtable content to a new SST file, then clears the
+    /// WAL and memtable. The SST file is named `sst-{N}.json` and the manifest is
+    /// updated atomically via a temp-file rename. The WAL and memtable are only
+    /// cleared after the SST write succeeds, so a failure leaves them intact.
     /// # Errors
     /// Returns an `io::Error` if there is an issue creating, writing, or syncing
     /// any of the SST, manifest, or WAL files.
@@ -254,6 +263,11 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Appends `sst_file_name` to the manifest and atomically replaces the manifest
+    /// file via a temp-file rename. Both the updated manifest and the storage directory
+    /// are synced before returning to guarantee durability.
+    /// # Errors
+    /// Returns an `io::Error` if any read, write, sync, or rename operation fails.
     fn update_manifest(&mut self, sst_file_name: String) -> Result<()> {
         let mut manifest_content = fs::read(self.directory_path.join(MANIFEST))?;
         writeln!(manifest_content, "{}", sst_file_name)?;
@@ -274,6 +288,9 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Serializes the current memtable into a sorted JSON array suitable for writing
+    /// to an SST file. Entries are sorted by key and include both live values and
+    /// tombstones so that deletions are persisted correctly.
     fn create_flush_content(&self) -> Value {
         let mut entries: Vec<(&String, &MemtableEntry)> = self.memtable.iter().collect();
         entries.sort_by_key(|(k, _)| *k);
@@ -300,6 +317,16 @@ impl StorageEngine {
         json_flush
     }
 
+    /// Merges all existing SST files into a minimal set of new SST files using a
+    /// k-way min-heap merge. For duplicate keys across files, the newest file's value
+    /// wins (files are ordered newest-first). Tombstones are dropped so that deleted
+    /// keys do not appear in the compacted output.
+    ///
+    /// After writing the new SST files, the manifest is updated atomically to list only
+    /// the new files, and the old SST files are deleted. Compaction runs synchronously
+    /// and blocks all writes for its duration.
+    /// # Errors
+    /// Returns an `io::Error` if any SST, manifest, or directory operation fails.
     fn compact_sst_files(&mut self) -> Result<()> {
         println!("Starting compaction...");
         let mut min_heap = BinaryHeap::new();
@@ -409,6 +436,12 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Writes `sst_entries` as a JSON array to the next SST file (`sst-{N+1}.json`),
+    /// syncs it to disk, updates the manifest atomically, and increments the SST file
+    /// counter. The file is always created fresh (truncating any existing file at that path).
+    /// # Errors
+    /// Returns an `io::Error` if the file cannot be created, written, or synced, or if
+    /// the manifest update fails.
     fn write_sst_file(&mut self, sst_entries: Value) -> Result<()> {
         let tmp_count = self.sst_file_counter + 1;
         let sst_file_name = format!("sst-{tmp_count}.json");
