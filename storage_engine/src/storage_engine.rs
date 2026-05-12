@@ -331,8 +331,7 @@ impl StorageEngine {
                 )));
             }
         }
-        while let Some(Reverse((key, _file_index, value))) = min_heap.pop() {
-            min_heap.retain(|x| x.0.0 != key);
+        while let Some(Reverse((key, file_index, value))) = min_heap.pop() {
             if value.is_some() {
                 let sst_entry = SSTEntry {
                     key: key.clone(),
@@ -347,25 +346,28 @@ impl StorageEngine {
                 self.write_sst_file(content)?;
                 sst_entries.clear();
             }
-            for (file_index, iter) in file_iters.iter_mut().enumerate() {
-                if let Some(entry) = iter.peek()
-                    && entry.key == key
-                {
-                    iter.next();
-                    if let Some(next_entry) = iter.peek() {
-                        min_heap.push(Reverse((
-                            next_entry.key.clone(),
-                            file_index,
-                            next_entry.value.clone(),
-                        )));
-                    }
+
+            file_iters[file_index].next();
+            if let Some(next_entry) = file_iters[file_index].peek() {
+                min_heap.push(Reverse((
+                    next_entry.key.clone(),
+                    file_index,
+                    next_entry.value.clone(),
+                )));
+            }
+            while min_heap.peek().is_some_and(|x| x.0.0 == key) {
+                let Some(Reverse((_, dup_index, _))) = min_heap.pop() else {
+                    break;
+                };
+                file_iters[dup_index].next();
+                if let Some(next) = file_iters[dup_index].peek() {
+                    min_heap.push(Reverse((next.key.clone(), file_index, next.value.clone())));
                 }
             }
         }
         if !sst_entries.is_empty() {
             let content = json!(sst_entries);
             self.write_sst_file(content)?;
-            sst_entries.clear();
         }
 
         // INFO: Clean up section
