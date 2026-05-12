@@ -104,9 +104,9 @@ curl -X DELETE http://127.0.0.1:8080/mykey
 - [x] Week 1: [In-Memory Store](https://read.thecoder.cafe/p/build-your-own-kv-engine-1)
 - [x] Week 2: [LSM Tree Foundations](https://read.thecoder.cafe/p/build-your-own-kv-engine-2)
 - [x] Week 3: [Durability with Write-Ahead Logging](https://read.thecoder.cafe/p/build-your-own-kv-engine-3)
-- [ ] Week 4: [Deletes, Tombstones, and Compaction](https://read.thecoder.cafe/p/build-your-own-kv-engine-4)
+- [x] Week 4: [Deletes, Tombstones, and Compaction](https://read.thecoder.cafe/p/build-your-own-kv-engine-4)
 - [ ] Week 5: [Leveling and Key-Range Partitioning](https://read.thecoder.cafe/p/build-your-own-kv-engine-5)
 - [ ] Week 6: [Block-Based SSTables and Indexing](https://read.thecoder.cafe/p/build-your-own-kv-engine-6)
-- [ ] Week 7: Bloom Filters and Trie Memtable
-- [ ] Week 8: Concurrency
+- [ ] Week 7: [Bloom Filters and Trie Memtable](https://read.thecoder.cafe/p/build-your-own-kv-engine-7)
+- [ ] Week 8: [Concurrency](https://read.thecoder.cafe/p/build-your-own-kv-engine-8)
 
