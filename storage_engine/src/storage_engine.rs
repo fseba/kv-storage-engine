@@ -8,10 +8,12 @@ use std::{
 };
 
 mod lru_cache;
+mod manifest;
 
 use serde_json::{Value, json};
 
 use lru_cache::LRUCache;
+use manifest::{Manifest, ManifestLayer, ManifestLayerNEntry};
 
 const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
@@ -256,7 +258,7 @@ impl StorageEngine {
     /// Returns an `io::Error` if there is an issue creating, writing, or syncing
     /// any of the SST, manifest, or WAL files.
     fn flush(&mut self, flush_content: Value) -> Result<()> {
-        self.write_sst_file(flush_content)?;
+        self.write_sst_file(flush_content, ManifestLayer::L0)?;
         // Clear the WAL after a successful flush
         File::create(self.directory_path.join(WAL))?.sync_data()?;
         self.memtable.clear();
@@ -268,9 +270,11 @@ impl StorageEngine {
     /// are synced before returning to guarantee durability.
     /// # Errors
     /// Returns an `io::Error` if any read, write, sync, or rename operation fails.
-    fn update_manifest(&mut self, sst_file_name: String) -> Result<()> {
-        let mut manifest_content = fs::read(self.directory_path.join(MANIFEST))?;
-        writeln!(manifest_content, "{}", sst_file_name)?;
+    fn update_manifest(&mut self, manifest: Manifest) -> Result<()> {
+        let mut manifest_content = Vec::new();
+        write!(manifest_content, "{}", manifest)?;
+        writeln!(manifest_content)?;
+
         let mut manifest_temp = File::options()
             .create(true)
             .write(true)
@@ -328,6 +332,7 @@ impl StorageEngine {
     /// # Errors
     /// Returns an `io::Error` if any SST, manifest, or directory operation fails.
     fn compact_sst_files(&mut self) -> Result<()> {
+        // TODO: Adapt to new manifest layout
         println!("Starting compaction...");
         let mut min_heap = BinaryHeap::new();
         let manifest_path = self.directory_path.join(MANIFEST);
@@ -370,7 +375,11 @@ impl StorageEngine {
             }
             if sst_entries.len() >= MAX_ENTRIES {
                 let content = json!(sst_entries);
-                self.write_sst_file(content)?;
+                // TODO: Create key range
+                self.write_sst_file(
+                    content,
+                    ManifestLayer::L1("range must be created".to_string()),
+                )?;
                 sst_entries.clear();
             }
 
@@ -394,7 +403,11 @@ impl StorageEngine {
         }
         if !sst_entries.is_empty() {
             let content = json!(sst_entries);
-            self.write_sst_file(content)?;
+            // TODO: Create key range
+            self.write_sst_file(
+                content,
+                ManifestLayer::L1("range must be created".to_string()),
+            )?;
         }
 
         // INFO: Clean up section
@@ -442,14 +455,23 @@ impl StorageEngine {
     /// # Errors
     /// Returns an `io::Error` if the file cannot be created, written, or synced, or if
     /// the manifest update fails.
-    fn write_sst_file(&mut self, sst_entries: Value) -> Result<()> {
+    fn write_sst_file(&mut self, sst_entries: Value, manifest_layer: ManifestLayer) -> Result<()> {
         let tmp_count = self.sst_file_counter + 1;
         let sst_file_name = format!("sst-{tmp_count}.json");
         // INFO: Truncates file
         let sst_file = File::create(self.directory_path.join(&sst_file_name))?;
         serde_json::to_writer(BufWriter::new(&sst_file), &sst_entries)?;
         sst_file.sync_data()?;
-        self.update_manifest(sst_file_name)?;
+        let mut manifest =
+            Manifest::parse(&fs::read_to_string(self.directory_path.join(MANIFEST))?);
+        match manifest_layer {
+            ManifestLayer::L0 => manifest.l0.push(sst_file_name),
+            ManifestLayer::L1(range) => manifest.l1.push(ManifestLayerNEntry {
+                range,
+                file_name: sst_file_name,
+            }),
+        }
+        self.update_manifest(manifest)?;
         self.sst_file_counter += 1;
         Ok(())
     }
@@ -779,7 +801,7 @@ mod tests {
 
         let manifest_content = fs::read_to_string(dir.path().join(MANIFEST)).unwrap();
         assert_eq!(
-            manifest_content, "sst-1.json\nsst-2.json\n",
+            manifest_content, "[L0]\nsst-1.json\nsst-2.json\n\n[L1]\n\n",
             "Manifest should contain the latest SST file name"
         );
     }
