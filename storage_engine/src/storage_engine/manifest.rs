@@ -28,15 +28,38 @@ impl Manifest {
                         break;
                     }
                     if let Some((range, file_name)) = l1_line.split_once(": ") {
-                        manifest.l1.push(ManifestLayerNEntry {
-                            range: range.to_string(),
-                            file_name: file_name.to_string(),
-                        });
+                        if let Some((start, end)) = range.split_once('-') {
+                            manifest.l1.push(ManifestLayerNEntry {
+                                range: LayerRange {
+                                    start: start.to_string(),
+                                    end: end.to_string(),
+                                },
+                                file_name: file_name.to_string(),
+                            });
+                        };
                     }
                 }
             }
         }
         manifest
+    }
+
+    pub fn get_latest_count(&self) -> Option<usize> {
+        let parse_num = |name: &String| -> Option<usize> {
+            name.strip_prefix("sst-")?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()
+        };
+        let max_l0 = self.l0.iter().filter_map(parse_num).max();
+
+        let max_l1 = self.l1.iter().filter_map(|e| parse_num(&e.file_name)).max();
+
+        // [max_l0, max_l1].into_iter().flatten().max()
+        match (max_l0, max_l1) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -58,7 +81,7 @@ impl Display for Manifest {
 
 #[derive(Debug)]
 pub struct ManifestLayerNEntry {
-    pub range: String,
+    pub range: LayerRange,
     pub file_name: String,
 }
 
@@ -71,7 +94,19 @@ impl Display for ManifestLayerNEntry {
 #[derive(Debug)]
 pub enum ManifestLayer {
     L0,
-    L1(String),
+    L1(LayerRange),
+}
+
+#[derive(Debug)]
+pub struct LayerRange {
+    pub start: String,
+    pub end: String,
+}
+
+impl Display for LayerRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.start, self.end)
+    }
 }
 
 #[cfg(test)]
@@ -84,9 +119,28 @@ mod test {
         let manifest = Manifest::parse(manifest_content);
         assert_eq!(manifest.l0, vec!["file1".to_string(), "file2".to_string()]);
         assert_eq!(manifest.l1.len(), 2);
-        assert_eq!(manifest.l1[0].range, "0-100".to_string());
+        assert_eq!(manifest.l1[0].range.start, "0");
+        assert_eq!(manifest.l1[0].range.end, "100");
         assert_eq!(manifest.l1[0].file_name, "file3".to_string());
-        assert_eq!(manifest.l1[1].range, "101-200".to_string());
+        assert_eq!(manifest.l1[1].range.start, "101");
+        assert_eq!(manifest.l1[1].range.end, "200");
         assert_eq!(manifest.l1[1].file_name, "file4".to_string());
+    }
+
+    #[test]
+    fn get_latest_sst_count_returns_highest_sst_file_number() {
+        let manifest_content =
+            "[L0]\nsst-11.json\nsst-2.json\n\n[L1]\n0-100: sst-3.json\n101-200: sst-4.json\n\n";
+        let manifest = Manifest::parse(manifest_content);
+        let latest_count = manifest.get_latest_count();
+        assert_eq!(latest_count, Some(11))
+    }
+
+    #[test]
+    fn get_latest_sst_count_returns_none_for_empty_manifest() {
+        let manifest_content = "[L0]\n\n[L1]\n\n";
+        let manifest = Manifest::parse(manifest_content);
+        let latest_count = manifest.get_latest_count();
+        assert_eq!(latest_count, None)
     }
 }

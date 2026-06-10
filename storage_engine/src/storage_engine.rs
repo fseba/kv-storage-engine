@@ -1,9 +1,9 @@
+use std::ops::Not;
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
-    fs::{self, File},
-    io::{BufReader, BufWriter, Read, Result, Write},
-    ops::Not,
+    collections::{BinaryHeap, HashMap},
+    fs::{self, DirBuilder, File},
+    io::{BufReader, BufWriter, Result, Write},
     path::{Path, PathBuf},
 };
 
@@ -15,11 +15,17 @@ use serde_json::{Value, json};
 use lru_cache::LRUCache;
 use manifest::{Manifest, ManifestLayer, ManifestLayerNEntry};
 
+use crate::storage_engine::manifest::LayerRange;
+
 const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TEMP: &str = "MANIFEST.tmp";
 const WAL: &str = "wal.db";
 const COMPACTION_TRIGGER_COUNT: usize = 10000;
+
+const L0_DIR: &str = "l0";
+
+const L1_DIR: &str = "l1";
 
 /// An in-memory key-value storage engine backed by SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
@@ -81,14 +87,19 @@ impl StorageEngine {
         let manifest_path = engine.directory_path.join(MANIFEST);
         if manifest_path.exists() {
             let content = fs::read_to_string(manifest_path)?;
-            if let Some(latest_file) = content.lines().last()
-                && let Some(counter) = parse_sst_filename(latest_file)
-            {
+            let manifest = Manifest::parse(&content);
+            if let Some(counter) = manifest.get_latest_count() {
                 engine.sst_file_counter = counter;
             }
         } else {
             File::create(manifest_path)?;
         }
+        DirBuilder::new()
+            .recursive(true)
+            .create(engine.directory_path.join(L0_DIR))?;
+        DirBuilder::new()
+            .recursive(true)
+            .create(engine.directory_path.join(L1_DIR))?;
 
         let wal_path = engine.directory_path.join(WAL);
         if wal_path.exists() {
@@ -332,7 +343,6 @@ impl StorageEngine {
     /// # Errors
     /// Returns an `io::Error` if any SST, manifest, or directory operation fails.
     fn compact_sst_files(&mut self) -> Result<()> {
-        // TODO: Adapt to new manifest layout
         println!("Starting compaction...");
         let mut min_heap = BinaryHeap::new();
         let manifest_path = self.directory_path.join(MANIFEST);
@@ -342,15 +352,27 @@ impl StorageEngine {
         }
 
         let old_manifest_content = fs::read_to_string(&manifest_path)?;
-        let sst_file_names = old_manifest_content.lines().rev();
+        let mut manifest = Manifest::parse(&old_manifest_content);
         let mut file_iters = Vec::new();
-        for file_name in sst_file_names {
-            let file = File::open(self.directory_path.join(file_name))?;
+
+        for l0_file_name in manifest.l0.iter().rev() {
+            let file = File::open(self.directory_path.join(L0_DIR).join(l0_file_name))?;
             let reader = BufReader::new(file);
             let file_iter = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
                 .into_iter()
                 .peekable();
             file_iters.push(file_iter);
+        }
+
+        let mut l1_entries_to_be_deleted = Vec::new();
+        for l1_entry in manifest.l1.iter().rev() {
+            let file = File::open(self.directory_path.join(L1_DIR).join(&l1_entry.file_name))?;
+            let reader = BufReader::new(file);
+            let file_iter = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
+                .into_iter()
+                .peekable();
+            file_iters.push(file_iter);
+            l1_entries_to_be_deleted.push(l1_entry.file_name.clone());
         }
 
         let mut sst_entries = Vec::with_capacity(MAX_ENTRIES);
@@ -374,12 +396,9 @@ impl StorageEngine {
                 self.negative_cache.remove(&key);
             }
             if sst_entries.len() >= MAX_ENTRIES {
+                let key_range = get_layer_key_range(&sst_entries);
                 let content = json!(sst_entries);
-                // TODO: Create key range
-                self.write_sst_file(
-                    content,
-                    ManifestLayer::L1("range must be created".to_string()),
-                )?;
+                self.write_sst_file(content, ManifestLayer::L1(key_range))?;
                 sst_entries.clear();
             }
 
@@ -403,45 +422,21 @@ impl StorageEngine {
         }
         if !sst_entries.is_empty() {
             let content = json!(sst_entries);
-            // TODO: Create key range
-            self.write_sst_file(
-                content,
-                ManifestLayer::L1("range must be created".to_string()),
-            )?;
+            let key_range = get_layer_key_range(&sst_entries);
+            self.write_sst_file(content, ManifestLayer::L1(key_range))?;
         }
 
         // INFO: Clean up section
-        let mut manifest_content = String::new();
-        {
-            let mut manifest_file = File::open(&manifest_path)?;
-            manifest_file.read_to_string(&mut manifest_content)?;
-        }
+        manifest
+            .l0
+            .retain(|file| fs::remove_file(self.directory_path.join(L0_DIR).join(file)).is_err());
+        manifest
+            .l1
+            .retain(|entry| !l1_entries_to_be_deleted.contains(&entry.file_name));
+        self.update_manifest(manifest)?;
 
-        let old_lines: HashSet<&str> = old_manifest_content.lines().collect();
-        manifest_content = manifest_content
-            .lines()
-            .filter(|line| !old_lines.contains(*line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !manifest_content.is_empty() {
-            manifest_content.push('\n');
-        }
-
-        {
-            let mut manifest_temp = File::options()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(self.directory_path.join(MANIFEST_TEMP))?;
-            manifest_temp.write_all(manifest_content.as_bytes())?;
-            manifest_temp.sync_data()?;
-        }
-        fs::rename(self.directory_path.join(MANIFEST_TEMP), &manifest_path)?;
-        let manifest = File::open(&manifest_path)?;
-        manifest.sync_data()?;
-        self.sync_parent_dir()?;
-        for line in old_lines {
-            fs::remove_file(self.directory_path.join(line))?
+        for file in l1_entries_to_be_deleted {
+            fs::remove_file(self.directory_path.join(L1_DIR).join(file))?
         }
         self.sync_parent_dir()?;
 
@@ -459,7 +454,14 @@ impl StorageEngine {
         let tmp_count = self.sst_file_counter + 1;
         let sst_file_name = format!("sst-{tmp_count}.json");
         // INFO: Truncates file
-        let sst_file = File::create(self.directory_path.join(&sst_file_name))?;
+        let sst_file = match manifest_layer {
+            ManifestLayer::L0 => {
+                File::create(self.directory_path.join(L0_DIR).join(&sst_file_name))?
+            }
+            ManifestLayer::L1(_) => {
+                File::create(self.directory_path.join(L1_DIR).join(&sst_file_name))?
+            }
+        };
         serde_json::to_writer(BufWriter::new(&sst_file), &sst_entries)?;
         sst_file.sync_data()?;
         let mut manifest =
@@ -474,6 +476,21 @@ impl StorageEngine {
         self.update_manifest(manifest)?;
         self.sst_file_counter += 1;
         Ok(())
+    }
+}
+
+fn get_layer_key_range(sst_entries: &[SSTEntry]) -> LayerRange {
+    let range_start = sst_entries
+        .first()
+        .map(|e| e.key.clone())
+        .unwrap_or_default();
+    let range_end = sst_entries
+        .last()
+        .map(|e| e.key.clone())
+        .unwrap_or_default();
+    LayerRange {
+        start: range_start.clone(),
+        end: range_end.clone(),
     }
 }
 
@@ -496,14 +513,6 @@ struct WALRecord {
 enum WALRecordType {
     Put(String),
     Delete,
-}
-
-fn parse_sst_filename(filename: &str) -> Option<usize> {
-    filename
-        .strip_prefix("sst-")?
-        .strip_suffix(".json")?
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]
@@ -642,7 +651,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            fs::exists(dir.path().join("sst-1.json")).unwrap(),
+            fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap(),
             "File does not exist"
         );
     }
@@ -659,7 +668,7 @@ mod tests {
 
         let flush_content = engine.create_flush_content();
         engine.flush(flush_content).unwrap();
-        let content = fs::read_to_string(dir.path().join("sst-1.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(L0_DIR).join("sst-1.json")).unwrap();
         assert_eq!(
             content,
             "[{\"key\":\"a\",\"value\":\"v_1\"},{\"key\":\"b\",\"value\":\"v_2\"},{\"key\":\"c\",\"value\":\"v_3\"}]"
@@ -680,7 +689,7 @@ mod tests {
         engine.flush(flush_content).unwrap();
 
         assert!(
-            fs::exists(dir.path().join("sst-1.json")).unwrap(),
+            fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap(),
             "File does not exist"
         );
         assert!(
@@ -729,9 +738,9 @@ mod tests {
         engine.flush(flush_content).unwrap();
         let flush_content = engine.create_flush_content();
         engine.flush(flush_content).unwrap();
-        assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
-        assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
-        assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-3.json")).unwrap());
     }
 
     #[test]
@@ -761,12 +770,16 @@ mod tests {
     #[test]
     fn new_should_set_counter_from_latest_sst_table_file_name_in_manifest() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join(MANIFEST), "sst-1.json\n").unwrap();
+        fs::write(
+            dir.path().join(MANIFEST),
+            "[L0]\nsst-1.json\nsst-2.json\n\n[L1]\n\n",
+        )
+        .unwrap();
 
         let engine = StorageEngine::new(dir.path()).unwrap();
 
         assert_eq!(
-            engine.sst_file_counter, 1,
+            engine.sst_file_counter, 2,
             "File counter not correctly parsed from manifest"
         );
     }
@@ -848,17 +861,17 @@ mod tests {
                 .set(format!("aaa{i}"), "value_1".to_string())
                 .unwrap();
         }
-        assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
         for i in 0..(MAX_ENTRIES) {
             engine
                 .set(format!("aaa{i}"), "value_2".to_string())
                 .unwrap();
         }
-        assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
 
         engine.compact_sst_files().unwrap();
 
-        assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L1_DIR).join("sst-3.json")).unwrap());
         assert_eq!(engine.get("aaa0").unwrap(), "value_2".to_string());
         assert_eq!(engine.get("aaa100").unwrap(), "value_2".to_string());
     }
@@ -872,18 +885,18 @@ mod tests {
                 .set(format!("aaa{i}"), "value_1".to_string())
                 .unwrap();
         }
-        assert!(fs::exists(dir.path().join("sst-1.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
         engine.delete("aaa0").unwrap();
         for i in 1..(MAX_ENTRIES) {
             engine
                 .set(format!("aaa{i}"), "value_2".to_string())
                 .unwrap();
         }
-        assert!(fs::exists(dir.path().join("sst-2.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
 
         engine.compact_sst_files().unwrap();
 
-        assert!(fs::exists(dir.path().join("sst-3.json")).unwrap());
+        assert!(fs::exists(dir.path().join(L1_DIR).join("sst-3.json")).unwrap());
         assert!(engine.get("aaa0").is_none());
     }
 }
