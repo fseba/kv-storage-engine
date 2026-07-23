@@ -427,6 +427,7 @@ impl StorageEngine {
         }
 
         // INFO: Clean up section
+        manifest = Manifest::parse(&fs::read_to_string(self.directory_path.join(MANIFEST))?);
         manifest
             .l0
             .retain(|file| fs::remove_file(self.directory_path.join(L0_DIR).join(file)).is_err());
