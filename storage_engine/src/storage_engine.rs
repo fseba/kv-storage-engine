@@ -395,12 +395,6 @@ impl StorageEngine {
                 sst_entries.push(sst_entry);
                 self.negative_cache.remove(&key);
             }
-            if sst_entries.len() >= MAX_ENTRIES {
-                let key_range = get_layer_key_range(&sst_entries);
-                let content = json!(sst_entries);
-                self.write_sst_file(content, ManifestLayer::L1(key_range))?;
-                sst_entries.clear();
-            }
 
             file_iters[file_index].next();
             if let Some(next_entry) = file_iters[file_index].peek() {
@@ -419,10 +413,39 @@ impl StorageEngine {
                     min_heap.push(Reverse((next.key.clone(), file_index, next.value.clone())));
                 }
             }
+
+            if sst_entries.len() >= MAX_ENTRIES {
+                let range_start = sst_entries
+                    .first()
+                    .map(|e| e.key.clone())
+                    .unwrap_or_default();
+                let range_end = min_heap
+                    .peek()
+                    .map(|Reverse((end, _, _))| end.clone())
+                    .unwrap_or_else(|| increment_key(&key));
+                let key_range = LayerRange {
+                    start: range_start,
+                    end: range_end,
+                };
+                let content = json!(sst_entries);
+                self.write_sst_file(content, ManifestLayer::L1(key_range))?;
+                sst_entries.clear();
+            }
         }
         if !sst_entries.is_empty() {
+            let range_start = sst_entries
+                .first()
+                .map(|e| e.key.clone())
+                .unwrap_or_default();
+            let range_end = sst_entries
+                .last()
+                .map(|e| increment_key(&e.key))
+                .unwrap_or_default();
+            let key_range = LayerRange {
+                start: range_start,
+                end: range_end,
+            };
             let content = json!(sst_entries);
-            let key_range = get_layer_key_range(&sst_entries);
             self.write_sst_file(content, ManifestLayer::L1(key_range))?;
         }
 
@@ -480,19 +503,14 @@ impl StorageEngine {
     }
 }
 
-fn get_layer_key_range(sst_entries: &[SSTEntry]) -> LayerRange {
-    let range_start = sst_entries
-        .first()
-        .map(|e| e.key.clone())
-        .unwrap_or_default();
-    let range_end = sst_entries
-        .last()
-        .map(|e| e.key.clone())
-        .unwrap_or_default();
-    LayerRange {
-        start: range_start.clone(),
-        end: range_end.clone(),
+fn increment_key(key: &str) -> String {
+    let mut bytes = key.as_bytes().to_vec();
+
+    if let Some(last) = bytes.last_mut() {
+        *last += 1; // safe: keys are always lowercase ASCII (< 0xFF), no overflow risk
     }
+
+    bytes.into_iter().map(|b| b as char).collect()
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -878,6 +896,43 @@ mod tests {
     }
 
     #[test]
+    fn compact_sst_files_sets_layer_range() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        let alpha_key = |prefix: char, n: usize| -> String {
+            let c1 = (b'a' + (n / 676) as u8) as char;
+            let c2 = (b'a' + ((n / 26) % 26) as u8) as char;
+            let c3 = (b'a' + (n % 26) as u8) as char;
+            format!("{}{}{}{}", prefix, c1, c2, c3)
+        };
+
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(alpha_key('a', i), "value_1".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
+        dbg!(MAX_ENTRIES);
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(alpha_key('b', i), "value_2".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(engine.directory_path.join(L0_DIR).join("sst-2.json")).unwrap());
+
+        engine.compact_sst_files().unwrap();
+
+        assert!(fs::exists(engine.directory_path.join(L1_DIR).join("sst-3.json")).unwrap());
+        assert!(fs::exists(engine.directory_path.join(L1_DIR).join("sst-4.json")).unwrap());
+        let manifest_content = fs::read_to_string(engine.directory_path.join(MANIFEST)).unwrap();
+        println!("Manifest content: {}", manifest_content);
+        let manifest = Manifest::parse(&manifest_content);
+        let l1_entry = manifest.l1.first().unwrap();
+        assert_eq!(l1_entry.range.start, "aaaa".to_string());
+        assert_eq!(l1_entry.range.end, "baaa".to_string());
+    }
+
+    #[test]
     fn compact_sst_files_drops_tombstones() {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
@@ -899,5 +954,11 @@ mod tests {
 
         assert!(fs::exists(dir.path().join(L1_DIR).join("sst-3.json")).unwrap());
         assert!(engine.get("aaa0").is_none());
+    }
+
+    #[test]
+    fn increment_key_increments_key_by_one() {
+        let result = increment_key("aadhp");
+        assert_eq!("aadhq", result);
     }
 }
