@@ -1,47 +1,51 @@
 use std::fmt::Display;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Manifest {
     pub l0: Vec<String>,
     pub l1: Vec<ManifestLayerNEntry>,
 }
 
 impl Manifest {
-    pub fn parse(content: &str) -> Self {
+    pub fn parse(content: &str) -> Result<Self, ParseError> {
+        let mut manifest = Manifest::default();
         let mut lines = content.lines();
-        let mut manifest = Manifest {
-            l0: Vec::new(),
-            l1: Vec::new(),
-        };
 
         while let Some(line) = lines.next() {
-            if line == "[L0]" {
-                for l0_line in lines.by_ref() {
-                    if l0_line.is_empty() {
-                        break;
-                    }
-                    manifest.l0.push(l0_line.to_string());
-                }
-            } else if line == "[L1]" {
-                for l1_line in lines.by_ref() {
-                    if l1_line.is_empty() {
-                        break;
-                    }
-                    if let Some((range, file_name)) = l1_line.split_once(": ") {
-                        if let Some((start, end)) = range.split_once('-') {
-                            manifest.l1.push(ManifestLayerNEntry {
-                                range: LayerRange {
-                                    start: start.to_string(),
-                                    end: end.to_string(),
-                                },
-                                file_name: file_name.to_string(),
-                            });
-                        };
+            match line {
+                "[L0]" => {
+                    for l0_line in lines
+                        .by_ref()
+                        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+                    {
+                        manifest.l0.push(l0_line.to_string());
                     }
                 }
+                "[L1]" => {
+                    for l1_line in lines
+                        .by_ref()
+                        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+                    {
+                        let (range, file_name) = l1_line
+                            .split_once(": ")
+                            .ok_or_else(|| ParseError::MalformedLine(l1_line.to_string()))?;
+                        let (start, end) = range
+                            .split_once('-')
+                            .ok_or_else(|| ParseError::MalformedLine(l1_line.to_string()))?;
+                        manifest.l1.push(ManifestLayerNEntry {
+                            range: LayerRange {
+                                start: start.to_string(),
+                                end: end.to_string(),
+                            },
+                            file_name: file_name.to_string(),
+                        });
+                    }
+                }
+                _ => {}
             }
         }
-        manifest
+
+        Ok(manifest)
     }
 
     pub fn get_latest_count(&self) -> Option<usize> {
@@ -79,7 +83,7 @@ impl Display for Manifest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ManifestLayerNEntry {
     pub range: LayerRange,
     pub file_name: String,
@@ -91,13 +95,14 @@ impl Display for ManifestLayerNEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum ManifestLayer {
+    #[default]
     L0,
     L1(LayerRange),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LayerRange {
     pub start: String,
     pub end: String,
@@ -109,6 +114,21 @@ impl Display for LayerRange {
     }
 }
 
+#[derive(Debug)]
+pub enum ParseError {
+    MalformedLine(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::MalformedLine(line) => write!(f, "malformed manifest line: {line}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 #[cfg(test)]
 mod test {
     use super::Manifest;
@@ -116,7 +136,7 @@ mod test {
     #[test]
     fn parse_manifest_creates_correct_struct() {
         let manifest_content = "[L0]\nfile1\nfile2\n\n[L1]\n0-100: file3\n101-200: file4\n\n";
-        let manifest = Manifest::parse(manifest_content);
+        let manifest = Manifest::parse(manifest_content).unwrap();
         assert_eq!(manifest.l0, vec!["file1".to_string(), "file2".to_string()]);
         assert_eq!(manifest.l1.len(), 2);
         assert_eq!(manifest.l1[0].range.start, "0");
@@ -131,7 +151,7 @@ mod test {
     fn get_latest_sst_count_returns_highest_sst_file_number() {
         let manifest_content =
             "[L0]\nsst-11.json\nsst-2.json\n\n[L1]\n0-100: sst-3.json\n101-200: sst-4.json\n\n";
-        let manifest = Manifest::parse(manifest_content);
+        let manifest = Manifest::parse(manifest_content).unwrap();
         let latest_count = manifest.get_latest_count();
         assert_eq!(latest_count, Some(11))
     }
@@ -139,7 +159,7 @@ mod test {
     #[test]
     fn get_latest_sst_count_returns_none_for_empty_manifest() {
         let manifest_content = "[L0]\n\n[L1]\n\n";
-        let manifest = Manifest::parse(manifest_content);
+        let manifest = Manifest::parse(manifest_content).unwrap();
         let latest_count = manifest.get_latest_count();
         assert_eq!(latest_count, None)
     }

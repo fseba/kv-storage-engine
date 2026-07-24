@@ -47,6 +47,7 @@ const L1_DIR: &str = "l1";
 #[derive(Debug)]
 pub struct StorageEngine {
     memtable: HashMap<String, MemtableEntry>,
+    manifest: Manifest,
     directory_path: PathBuf,
     sst_file_counter: usize,
     negative_cache: LRUCache,
@@ -61,8 +62,8 @@ enum MemtableEntry {
 
 impl StorageEngine {
     /// Creates a new storage engine at the given directory path.
-    /// Reads the [`MANIFEST`] file to recover the SST file counter. If the WAL
-    /// exists, its entries are replayed into the memtable to recover any writes
+    /// Creates the [`MANIFEST`] file or creates one and recovers the SST file counter.
+    /// If the WAL exists, its entries are replayed into the memtable to recover any writes
     /// from the previous session that were not yet flushed. If either file does
     /// not exist, an empty one is created.
     /// # Arguments
@@ -76,23 +77,27 @@ impl StorageEngine {
     /// # Errors
     /// Returns an `io::Error` if any file cannot be read, created, or synced.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let manifest_path = path.as_ref().join(MANIFEST);
+        let manifest = if manifest_path.exists() {
+            let content = fs::read_to_string(manifest_path)?;
+            match Manifest::parse(&content) {
+                Ok(m) => m,
+                Err(err) => panic!("{}", err),
+            }
+        } else {
+            File::create(manifest_path)?;
+            Manifest::default()
+        };
         let mut engine = Self {
             memtable: HashMap::with_capacity(MAX_ENTRIES),
+            manifest,
             directory_path: path.as_ref().to_path_buf(),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
             update_counter: 0,
         };
-
-        let manifest_path = engine.directory_path.join(MANIFEST);
-        if manifest_path.exists() {
-            let content = fs::read_to_string(manifest_path)?;
-            let manifest = Manifest::parse(&content);
-            if let Some(counter) = manifest.get_latest_count() {
-                engine.sst_file_counter = counter;
-            }
-        } else {
-            File::create(manifest_path)?;
+        if let Some(counter) = engine.manifest.get_latest_count() {
+            engine.sst_file_counter = counter;
         }
         DirBuilder::new()
             .recursive(true)
@@ -281,9 +286,9 @@ impl StorageEngine {
     /// are synced before returning to guarantee durability.
     /// # Errors
     /// Returns an `io::Error` if any read, write, sync, or rename operation fails.
-    fn update_manifest(&mut self, manifest: Manifest) -> Result<()> {
+    fn update_manifest(&mut self) -> Result<()> {
         let mut manifest_content = Vec::new();
-        write!(manifest_content, "{}", manifest)?;
+        write!(manifest_content, "{}", self.manifest)?;
         writeln!(manifest_content)?;
 
         let mut manifest_temp = File::options()
@@ -351,11 +356,9 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let old_manifest_content = fs::read_to_string(&manifest_path)?;
-        let mut manifest = Manifest::parse(&old_manifest_content);
         let mut file_iters = Vec::new();
 
-        for l0_file_name in manifest.l0.iter().rev() {
+        for l0_file_name in self.manifest.l0.iter().rev() {
             let file = File::open(self.directory_path.join(L0_DIR).join(l0_file_name))?;
             let reader = BufReader::new(file);
             let file_iter = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
@@ -365,7 +368,7 @@ impl StorageEngine {
         }
 
         let mut l1_entries_to_be_deleted = Vec::new();
-        for l1_entry in manifest.l1.iter().rev() {
+        for l1_entry in self.manifest.l1.iter().rev() {
             let file = File::open(self.directory_path.join(L1_DIR).join(&l1_entry.file_name))?;
             let reader = BufReader::new(file);
             let file_iter = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
@@ -450,14 +453,13 @@ impl StorageEngine {
         }
 
         // INFO: Clean up section
-        manifest = Manifest::parse(&fs::read_to_string(self.directory_path.join(MANIFEST))?);
-        manifest
+        self.manifest
             .l0
             .retain(|file| fs::remove_file(self.directory_path.join(L0_DIR).join(file)).is_err());
-        manifest
+        self.manifest
             .l1
             .retain(|entry| !l1_entries_to_be_deleted.contains(&entry.file_name));
-        self.update_manifest(manifest)?;
+        self.update_manifest()?;
 
         for file in l1_entries_to_be_deleted {
             fs::remove_file(self.directory_path.join(L1_DIR).join(file))?
@@ -488,16 +490,14 @@ impl StorageEngine {
         };
         serde_json::to_writer(BufWriter::new(&sst_file), &sst_entries)?;
         sst_file.sync_data()?;
-        let mut manifest =
-            Manifest::parse(&fs::read_to_string(self.directory_path.join(MANIFEST))?);
         match manifest_layer {
-            ManifestLayer::L0 => manifest.l0.push(sst_file_name),
-            ManifestLayer::L1(range) => manifest.l1.push(ManifestLayerNEntry {
+            ManifestLayer::L0 => self.manifest.l0.push(sst_file_name),
+            ManifestLayer::L1(range) => self.manifest.l1.push(ManifestLayerNEntry {
                 range,
                 file_name: sst_file_name,
             }),
         }
-        self.update_manifest(manifest)?;
+        self.update_manifest()?;
         self.sst_file_counter += 1;
         Ok(())
     }
@@ -770,6 +770,7 @@ mod tests {
                 ("b".to_string(), MemtableEntry::Value("v_2".to_string())),
                 ("c".to_string(), MemtableEntry::Value("v_3".to_string())),
             ]),
+            manifest: Manifest::default(),
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
@@ -926,8 +927,9 @@ mod tests {
         assert!(fs::exists(engine.directory_path.join(L1_DIR).join("sst-4.json")).unwrap());
         let manifest_content = fs::read_to_string(engine.directory_path.join(MANIFEST)).unwrap();
         println!("Manifest content: {}", manifest_content);
-        let manifest = Manifest::parse(&manifest_content);
-        let l1_entry = manifest.l1.first().unwrap();
+        let manifest = Manifest::parse(&manifest_content).unwrap();
+        let l1_entry = engine.manifest.l1.first().unwrap();
+        assert_eq!(l1_entry.file_name, manifest.l1.first().unwrap().file_name);
         assert_eq!(l1_entry.range.start, "aaaa".to_string());
         assert_eq!(l1_entry.range.end, "baaa".to_string());
     }
