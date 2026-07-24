@@ -58,6 +58,7 @@ async fn set_value(
     }
 }
 
+/// Handles `DELETE /{key}` — marks the key as deleted. Returns 500 on WAL write failure.
 async fn delete_value(
     engine: State<Arc<Mutex<StorageEngine>>>,
     Path(key): Path<String>,

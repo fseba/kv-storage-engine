@@ -91,7 +91,7 @@ pub struct ManifestLayerNEntry {
 
 impl Display for ManifestLayerNEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}: {}", self.range, self.file_name)
+        write!(f, "{}: {}", self.range, self.file_name)
     }
 }
 

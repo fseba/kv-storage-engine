@@ -21,19 +21,22 @@ const MAX_ENTRIES: usize = 2000;
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TEMP: &str = "MANIFEST.tmp";
 const WAL: &str = "wal.db";
-const COMPACTION_TRIGGER_COUNT: usize = 10000;
 
 const L0_DIR: &str = "l0";
 
 const L1_DIR: &str = "l1";
 
-/// An in-memory key-value storage engine backed by SST files on disk.
+/// An in-memory key-value storage engine backed by leveled SST files on disk.
 /// `StorageEngine` provides basic operations for storing and retrieving
 /// string key-value pairs. Each write is first appended to a write-ahead log
 /// (WAL) for durability, then inserted into an in-memory `HashMap` (memtable).
 /// When the memtable reaches [`MAX_ENTRIES`], it is flushed to a sorted SST
-/// file on disk and the WAL is cleared. On startup, any unflushed WAL entries
-/// are replayed into the memtable to recover writes from the last session.
+/// file under the L0 directory and the WAL is cleared. Once L0 accumulates
+/// 5 files, they are merged with any existing L1 files and rewritten as
+/// key-range-partitioned SST files under the L1 directory. The manifest
+/// tracking these files is kept in memory and persisted atomically on every
+/// flush and compaction. On startup, any unflushed WAL entries are replayed
+/// into the memtable to recover writes from the last session.
 /// # Examples
 /// ```
 /// use storage_engine::StorageEngine;
@@ -51,7 +54,6 @@ pub struct StorageEngine {
     directory_path: PathBuf,
     sst_file_counter: usize,
     negative_cache: LRUCache,
-    update_counter: usize,
 }
 
 #[derive(Debug)]
@@ -62,7 +64,8 @@ enum MemtableEntry {
 
 impl StorageEngine {
     /// Creates a new storage engine at the given directory path.
-    /// Creates the [`MANIFEST`] file or creates one and recovers the SST file counter.
+    /// Creates the [`MANIFEST`] file or parses an existing one into memory, recovering the
+    /// SST file counter, and creates the `l0`/`l1` subdirectories if they don't already exist.
     /// If the WAL exists, its entries are replayed into the memtable to recover any writes
     /// from the previous session that were not yet flushed. If either file does
     /// not exist, an empty one is created.
@@ -94,7 +97,6 @@ impl StorageEngine {
             directory_path: path.as_ref().to_path_buf(),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
-            update_counter: 0,
         };
         if let Some(counter) = engine.manifest.get_latest_count() {
             engine.sst_file_counter = counter;
@@ -175,8 +177,7 @@ impl StorageEngine {
             let flush_content = self.create_flush_content();
             self.flush(flush_content)?;
         }
-        self.update_counter += 1;
-        if self.update_counter.is_multiple_of(COMPACTION_TRIGGER_COUNT) {
+        if self.manifest.l0.len() == 5 {
             self.compact_sst_files()?;
         }
         Ok(())
@@ -184,7 +185,9 @@ impl StorageEngine {
 
     /// Retrieves the value associated with the given key.
     /// Checks the in-memory memtable first, then the negative cache (keys confirmed absent).
-    /// If not found in either, performs a linear scan across SST files from newest to oldest.
+    /// If not found in either, scans L0 SST files newest-to-oldest, then looks up the single
+    /// L1 SST file whose key range contains the key (L1 files are non-overlapping and sorted
+    /// by key range, so at most one file needs to be checked).
     /// On a miss, the key is added to the negative cache to skip SST scans on future lookups.
     /// Returns `None` if the key does not exist or has been deleted.
     /// # Arguments
@@ -211,9 +214,8 @@ impl StorageEngine {
             return None;
         }
 
-        for n in (1..=self.sst_file_counter).rev() {
-            let sst_file = format!("sst-{n}.json");
-            if let Ok(file) = File::open(self.directory_path.join(sst_file)) {
+        for l0_entry in self.manifest.l0.iter().rev() {
+            if let Ok(file) = File::open(self.directory_path.join(L0_DIR).join(l0_entry)) {
                 let Some(entries) =
                     serde_json::from_reader::<_, Vec<SSTEntry>>(BufReader::new(file)).ok()
                 else {
@@ -231,8 +233,30 @@ impl StorageEngine {
                 }
             }
         }
-        self.negative_cache.insert(key.to_string());
-        None
+
+        let result = self
+            .manifest
+            .l1
+            .iter()
+            .find(|entry| *entry.range.start <= *key && *key < *entry.range.end)
+            .and_then(|entry| {
+                let file =
+                    File::open(self.directory_path.join(L1_DIR).join(&entry.file_name)).ok()?;
+                let entries =
+                    serde_json::from_reader::<_, Vec<SSTEntry>>(BufReader::new(file)).ok()?;
+                entries.into_iter().find(|entry| entry.key == key)
+            });
+        match result {
+            Some(SSTEntry { value: Some(v), .. }) => Some(v),
+            Some(SSTEntry { deleted: true, .. }) | None => {
+                self.negative_cache.insert(key.to_string());
+                None
+            }
+            _ => {
+                eprintln!("Corrupt SST entry for key: {}", key);
+                None
+            }
+        }
     }
 
     /// Marks a key as deleted in the storage engine.
@@ -259,8 +283,7 @@ impl StorageEngine {
         self.negative_cache.insert(key.to_string());
         self.memtable
             .insert(key.to_string(), MemtableEntry::Deleted);
-        self.update_counter += 1;
-        if self.update_counter.is_multiple_of(COMPACTION_TRIGGER_COUNT) {
+        if self.manifest.l0.len() == 5 {
             self.compact_sst_files()?;
         }
         Ok(())
@@ -337,13 +360,14 @@ impl StorageEngine {
         json_flush
     }
 
-    /// Merges all existing SST files into a minimal set of new SST files using a
-    /// k-way min-heap merge. For duplicate keys across files, the newest file's value
-    /// wins (files are ordered newest-first). Tombstones are dropped so that deleted
-    /// keys do not appear in the compacted output.
+    /// Merges all existing L0 and L1 SST files into a minimal set of new, key-range-partitioned
+    /// L1 SST files using a k-way min-heap merge. For duplicate keys across files, the newest
+    /// file's value wins (files are ordered newest-first). Tombstones are dropped so that deleted
+    /// keys do not appear in the compacted output. Called automatically once the L0 directory
+    /// accumulates 5 files.
     ///
-    /// After writing the new SST files, the manifest is updated atomically to list only
-    /// the new files, and the old SST files are deleted. Compaction runs synchronously
+    /// After writing the new L1 SST files, the manifest is updated atomically to list only
+    /// the new files, and the old L0/L1 SST files are deleted. Compaction runs synchronously
     /// and blocks all writes for its duration.
     /// # Errors
     /// Returns an `io::Error` if any SST, manifest, or directory operation fails.
@@ -413,7 +437,7 @@ impl StorageEngine {
                 };
                 file_iters[dup_index].next();
                 if let Some(next) = file_iters[dup_index].peek() {
-                    min_heap.push(Reverse((next.key.clone(), file_index, next.value.clone())));
+                    min_heap.push(Reverse((next.key.clone(), dup_index, next.value.clone())));
                 }
             }
 
@@ -774,7 +798,6 @@ mod tests {
             directory_path: PathBuf::from("/non/existent/directory"),
             sst_file_counter: 0,
             negative_cache: LRUCache::new(100),
-            update_counter: 0,
         };
 
         let flush_content = engine.create_flush_content();
@@ -897,6 +920,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_sst_files_full_key_overlap_across_files_should_not_result_in_data_loss() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_2".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
+        for i in 0..(MAX_ENTRIES) {
+            engine
+                .set(format!("aaa{i}"), "value_3".to_string())
+                .unwrap();
+        }
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-3.json")).unwrap());
+
+        engine.compact_sst_files().unwrap();
+
+        for i in 0..(MAX_ENTRIES) {
+            let key = format!("aaa{i}");
+            assert_eq!(
+                engine.get(&key),
+                Some("value_3".to_string()),
+                "key '{key}' lost or has stale value after compacting 3 fully-overlapping SST files"
+            );
+        }
+    }
+
+    #[test]
     fn compact_sst_files_sets_layer_range() {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
@@ -956,6 +1014,8 @@ mod tests {
 
         assert!(fs::exists(dir.path().join(L1_DIR).join("sst-3.json")).unwrap());
         assert!(engine.get("aaa0").is_none());
+        assert!(engine.get("aaa1").is_some());
+        assert!(engine.get("aaa1111").is_some());
     }
 
     #[test]

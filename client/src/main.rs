@@ -188,8 +188,8 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
                             request.success = *expected == v;
                             if !request.success {
                                 let msg = format!(
-                                    "GET request failed with status: {} - expected {}, got {}",
-                                    result_status, *expected, v
+                                    "GET request for key '{}' failed with status: {} - expected '{}', got '{}'",
+                                    request.key, result_status, *expected, v
                                 );
                                 bar.println(msg);
                             }
