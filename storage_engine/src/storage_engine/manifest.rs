@@ -65,6 +65,14 @@ impl Manifest {
             (a, b) => a.or(b),
         }
     }
+
+    pub fn get_l1_files_within_range(&self, start: &str, end: &str) -> Vec<String> {
+        self.l1
+            .iter()
+            .filter(|f| f.range.start.as_str() < end && f.range.end.as_str() >= start)
+            .map(|f| f.file_name.clone())
+            .collect()
+    }
 }
 
 impl Display for Manifest {
@@ -162,5 +170,19 @@ mod test {
         let manifest = Manifest::parse(manifest_content).unwrap();
         let latest_count = manifest.get_latest_count();
         assert_eq!(latest_count, None)
+    }
+
+    #[test]
+    fn get_files_with_range_return_file_names() {
+        let manifest_content = "[L0]\nsst-11.json\nsst-2.json\n\n[L1]\na-c: sst-3.json\nc-dd: sst-4.json\ndd-zz: sst-5.json\n\n";
+        let manifest = Manifest::parse(manifest_content).unwrap();
+        let start = "a";
+        let end = "dd";
+        let files = manifest.get_l1_files_within_range(start, end);
+        assert!(files.contains(&"sst-3.json".to_string()));
+        assert!(files.contains(&"sst-4.json".to_string()));
+        assert!(!files.contains(&"sst-5.json".to_string()));
+        assert!(!files.contains(&"sst-2.json".to_string()));
+        assert!(!files.contains(&"sst-11.json".to_string()));
     }
 }

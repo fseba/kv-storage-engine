@@ -56,7 +56,7 @@ pub struct StorageEngine {
     negative_cache: LRUCache,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum MemtableEntry {
     Value(String),
     Deleted,
@@ -287,6 +287,66 @@ impl StorageEngine {
             self.compact_sst_files()?;
         }
         Ok(())
+    }
+
+    pub fn scan(&mut self, start: &str, end: &str) -> Result<String> {
+        let memtable_keys = self
+            .memtable
+            .iter()
+            .filter(|e| {
+                *e.0.as_str() < *end && *e.0.as_str() >= *start && *e.1 != MemtableEntry::Deleted
+            })
+            .map(|e| e.0.clone())
+            .collect::<Vec<String>>();
+        let memtable_deleted_keys = self
+            .memtable
+            .iter()
+            .filter(|e| {
+                *e.0.as_str() < *end && *e.0.as_str() >= *start && *e.1 == MemtableEntry::Deleted
+            })
+            .map(|e| e.0.clone())
+            .collect::<Vec<String>>();
+        let mut l0_keys = Vec::new();
+        let mut l0_deleted_keys = Vec::new();
+        for l0_file in self.manifest.l0.iter() {
+            let file = File::open(self.directory_path.join(L0_DIR).join(l0_file))?;
+            let reader = BufReader::new(file);
+            let entries = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?;
+            let mut keys = entries
+                .iter()
+                .filter(|e| e.key.as_str() < end && e.key.as_str() >= start && !e.deleted)
+                .map(|e| e.key.clone())
+                .collect::<Vec<String>>();
+            l0_keys.append(&mut keys);
+            let mut deleted_keys = entries
+                .into_iter()
+                .filter(|e| e.key.as_str() < end && e.key.as_str() >= start && e.deleted)
+                .map(|e| e.key)
+                .collect::<Vec<String>>();
+            l0_deleted_keys.append(&mut deleted_keys);
+        }
+        let mut l1_keys = Vec::new();
+        let l1_files = self.manifest.get_l1_files_within_range(start, end);
+        for l1_file in l1_files {
+            let file = File::open(self.directory_path.join(L1_DIR).join(l1_file))?;
+            let reader = BufReader::new(file);
+            let mut keys = serde_json::from_reader::<_, Vec<SSTEntry>>(reader)?
+                .into_iter()
+                .filter(|e| e.key.as_str() < end && e.key.as_str() >= start)
+                .map(|e| e.key)
+                .collect::<Vec<String>>();
+            l1_keys.append(&mut keys);
+        }
+
+        let mut keys: Vec<String> = memtable_keys
+            .into_iter()
+            .chain(l0_keys)
+            .chain(l1_keys)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys.retain(|k| !memtable_deleted_keys.contains(k) && !l0_deleted_keys.contains(k));
+        Ok(keys.join(","))
     }
 
     /// Writes pre-serialized memtable content to a new SST file, then clears the
@@ -1022,5 +1082,51 @@ mod tests {
     fn increment_key_increments_key_by_one() {
         let result = increment_key("aadhp");
         assert_eq!("aadhq", result);
+    }
+
+    #[test]
+    fn scan_returns_all_keys_of_files_in_range() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+        for i in 0..5 {
+            engine
+                .set(format!("aaa{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        for i in 0..5 {
+            engine
+                .set(format!("bbb{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-1.json")).unwrap());
+        for i in 5..10 {
+            engine
+                .set(format!("aaa{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        for i in 5..10 {
+            engine
+                .set(format!("bbb{i}"), "value_1".to_string())
+                .unwrap();
+        }
+        engine.delete("aaa1").unwrap();
+        let flush_content = engine.create_flush_content();
+        engine.flush(flush_content).unwrap();
+        assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
+        // engine.compact_sst_files().unwrap();
+        // assert!(fs::exists(dir.path().join(L1_DIR).join("sst-2.json")).unwrap());
+        engine.set("a".to_string(), "aaa_v".to_string()).unwrap();
+        engine.set("b".to_string(), "bbb_v".to_string()).unwrap();
+        engine.set("c".to_string(), "ccc_v".to_string()).unwrap();
+        engine.delete("aaa0").unwrap();
+
+        let result = engine.scan("a", "bbb3");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "a,aaa2,aaa3,aaa4,aaa5,aaa6,aaa7,aaa8,aaa9,b,bbb0,bbb1,bbb2".to_string()
+        );
     }
 }

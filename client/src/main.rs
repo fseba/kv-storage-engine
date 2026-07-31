@@ -10,7 +10,8 @@ use reqwest::StatusCode;
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
-const FILE_NAME: &str = "put-delete.txt";
+const FILE_NAME: &str = "put-delete-scan.txt";
+// const FILE_NAME: &str = "put-delete.txt";
 // const FILE_NAME: &str = "put.txt";
 
 #[derive(Debug)]
@@ -18,6 +19,7 @@ enum Method {
     Put(String),
     Get(String),
     Delete,
+    Scan(String, String, String),
 }
 
 #[derive(Debug)]
@@ -129,6 +131,12 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
                     "PUT" => Method::Put(parts[2].to_string()),
                     "GET" => Method::Get(parts[2].to_string()),
                     "DELETE" => Method::Delete,
+                    "SCAN" if parts.len() < 4 => return None,
+                    "SCAN" => Method::Scan(
+                        parts[1].to_string(),
+                        parts[2].to_string(),
+                        parts[3].to_string(),
+                    ),
                     _ => return None,
                 },
                 key: parts[1].to_string(),
@@ -147,10 +155,11 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
     let mut get_latencies: Vec<u128> = Vec::new();
     let mut put_latencies: Vec<u128> = Vec::new();
     let mut delete_latencies: Vec<u128> = Vec::new();
+    let mut scan_latencies: Vec<u128> = Vec::new();
 
     let bar = ProgressBar::new(requests.len() as u64);
-    // let msg = format!("{} loaded, starting requests...", FILE_NAME);
-    // bar.println(msg);
+    let msg = format!("{} loaded, starting requests...", FILE_NAME);
+    bar.println(msg);
     let timer_all = Instant::now();
 
     let mut last_successful_put: Option<(String, String)> = None;
@@ -211,6 +220,34 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
                     bar.println(msg);
                 }
             }
+            Method::Scan(start, end, expected) => {
+                let scan_url = format!("{base_url}/scan?start={start}&end={end}");
+                let res = client.get(&scan_url).send().await?;
+                scan_latencies.push(timer_request.elapsed().as_micros());
+                request.success = res.status() == StatusCode::OK;
+                if !request.success {
+                    let msg = format!("SCAN request failed with status: {}", res.status());
+                    bar.println(msg);
+                }
+                let result_status = res.status();
+                match res.text().await {
+                    Ok(v) => {
+                        request.success = *expected == v;
+                        if !request.success {
+                            let msg = format!(
+                                "SCAN request for range '{start}' - '{end}' failed with status: {} - expected '{}', got '{}'",
+                                result_status, *expected, v
+                            );
+                            bar.println(msg);
+                        }
+                    }
+                    Err(_) => {
+                        request.success = false;
+                        let msg = format!("SCAN request failed with status: {}", result_status);
+                        bar.println(msg);
+                    }
+                }
+            }
         }
 
         // If the request took longer than 1 second, we assume that the kv-storage-engine might have been
@@ -233,6 +270,7 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
                 }
                 Method::Get(_) => (),
                 Method::Delete => last_successful_delete = Some(request.key.clone()),
+                Method::Scan(..) => (),
             }
         }
         bar.inc(1);
@@ -253,6 +291,7 @@ async fn main() -> Result<(), reqwest_middleware::Error> {
     print_latency_metrics("GET", &mut get_latencies);
     print_latency_metrics("PUT", &mut put_latencies);
     print_latency_metrics("DELETE", &mut delete_latencies);
+    print_latency_metrics("SCAN", &mut scan_latencies);
 
     Ok(())
 }

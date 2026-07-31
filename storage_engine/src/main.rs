@@ -7,10 +7,12 @@ use std::{
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get, put},
 };
+
+use serde::Deserialize;
 
 use storage_engine::StorageEngine;
 
@@ -23,6 +25,7 @@ async fn main() -> io::Result<()> {
         .route("/{key}", get(get_value))
         .route("/{key}", put(set_value))
         .route("/{key}", delete(delete_value))
+        .route("/scan", get(scan_range))
         .with_state(engine);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
@@ -71,4 +74,28 @@ async fn delete_value(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+async fn scan_range(
+    engine: State<Arc<Mutex<StorageEngine>>>,
+    range: Query<ScanRange>,
+) -> Result<String, StatusCode> {
+    let range = range.0;
+    match engine
+        .lock()
+        .expect("mutex was poisoned")
+        .scan(&range.start, &range.end)
+    {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            eprintln!("Error scanning keys: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct ScanRange {
+    start: String,
+    end: String,
 }
