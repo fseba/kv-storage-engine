@@ -262,13 +262,15 @@ impl StorageEngine {
     /// Marks a key as deleted in the storage engine.
     /// Appends a delete record to the WAL for durability, inserts a tombstone into
     /// the memtable, and adds the key to the negative cache so future lookups return
-    /// immediately without scanning SST files. The deletion is persisted to SST during
-    /// the next flush; tombstones are dropped entirely during compaction.
+    /// immediately without scanning SST files. When the memtable reaches [`MAX_ENTRIES`],
+    /// it is automatically flushed to disk, mirroring [`Self::set`]. The deletion is
+    /// persisted to SST during the next flush; tombstones are dropped entirely during
+    /// compaction.
     /// # Arguments
     /// * `key` - The key to delete
     /// # Errors
     /// Returns an `io::Error` if the WAL cannot be written or synced, or if
-    /// compaction triggered by the update count fails.
+    /// flushing or compaction triggered by this delete fails.
     pub fn delete(&mut self, key: &str) -> Result<()> {
         let wal_record = WALRecord {
             key: key.to_string(),
@@ -283,6 +285,10 @@ impl StorageEngine {
         self.negative_cache.insert(key.to_string());
         self.memtable
             .insert(key.to_string(), MemtableEntry::Deleted);
+        if self.memtable.len() >= MAX_ENTRIES {
+            let flush_content = self.create_flush_content();
+            self.flush(flush_content)?;
+        }
         if self.manifest.l0.len() == 5 {
             self.compact_sst_files()?;
         }
@@ -627,6 +633,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_flushes_when_memtable_reaches_max_entries_alongside_puts() {
+        let dir = tempdir().unwrap();
+        let mut engine = StorageEngine::new(dir.path()).unwrap();
+
+        for i in 0..(MAX_ENTRIES - 1) {
+            engine
+                .set(format!("aaa{i:05}"), "value".to_string())
+                .unwrap();
+        }
+
+        engine.delete("mmm_not_yet_present").unwrap();
+
+        engine.set("zzz".to_string(), "last".to_string()).unwrap();
+
+        assert_eq!(engine.get("zzz"), Some("last".to_string()));
+        for i in 0..(MAX_ENTRIES - 1) {
+            assert_eq!(engine.get(&format!("aaa{i:05}")), Some("value".to_string()));
+        }
+    }
+
+    #[test]
     fn set_and_get() {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
@@ -737,10 +764,10 @@ mod tests {
     }
 
     #[test]
-    fn two_thousand_or_more_entries_trigger_a_flush() {
+    fn max_or_more_entries_trigger_a_flush() {
         let dir = tempdir().unwrap();
         let mut engine = StorageEngine::new(dir.path()).unwrap();
-        engine.memtable = (0..1999u32)
+        engine.memtable = (0..MAX_ENTRIES - 1)
             .map(|i| {
                 (
                     format!("key_{i}"),
@@ -1115,8 +1142,6 @@ mod tests {
         let flush_content = engine.create_flush_content();
         engine.flush(flush_content).unwrap();
         assert!(fs::exists(dir.path().join(L0_DIR).join("sst-2.json")).unwrap());
-        // engine.compact_sst_files().unwrap();
-        // assert!(fs::exists(dir.path().join(L1_DIR).join("sst-2.json")).unwrap());
         engine.set("a".to_string(), "aaa_v".to_string()).unwrap();
         engine.set("b".to_string(), "bbb_v".to_string()).unwrap();
         engine.set("c".to_string(), "ccc_v".to_string()).unwrap();
