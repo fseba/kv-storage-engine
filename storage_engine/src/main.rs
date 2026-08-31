@@ -76,6 +76,9 @@ async fn delete_value(
     }
 }
 
+/// Handles `GET /scan?start={start}&end={end}` — returns a comma-separated, sorted
+/// list of non-deleted keys in the half-open range `[start, end)`. Returns 500 on
+/// read failure.
 async fn scan_range(
     engine: State<Arc<Mutex<StorageEngine>>>,
     range: Query<ScanRange>,

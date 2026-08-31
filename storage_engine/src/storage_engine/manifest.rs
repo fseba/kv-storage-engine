@@ -7,6 +7,12 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Parses a manifest file's contents into a `Manifest`. Expects a `[L0]` section
+    /// listing SST file names one per line, followed by a `[L1]` section listing
+    /// `start-end: file_name` range entries, with sections separated by a blank line.
+    /// # Errors
+    /// Returns [`ParseError::MalformedLine`] if an `[L1]` line is missing the
+    /// `: ` file-name separator or the `-` range separator.
     pub fn parse(content: &str) -> Result<Self, ParseError> {
         let mut manifest = Manifest::default();
         let mut lines = content.lines();
@@ -48,6 +54,9 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// Returns the highest SST file counter (the `N` in `sst-{N}.json`) found across
+    /// both L0 and L1 entries, or `None` if the manifest has no SST files. Used on
+    /// startup to resume the SST file counter without file-system scanning.
     pub fn get_latest_count(&self) -> Option<usize> {
         let parse_num = |name: &String| -> Option<usize> {
             name.strip_prefix("sst-")?
@@ -66,6 +75,9 @@ impl Manifest {
         }
     }
 
+    /// Returns the file names of all L1 SST files whose key range overlaps
+    /// `[start, end)`. Used by [`crate::storage_engine::StorageEngine::scan`] to
+    /// avoid opening L1 files that cannot contain any key in the requested range.
     pub fn get_l1_files_within_range(&self, start: &str, end: &str) -> Vec<String> {
         self.l1
             .iter()

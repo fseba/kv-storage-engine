@@ -295,6 +295,17 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Returns a comma-separated, sorted list of all live (non-deleted) keys in the
+    /// half-open range `[start, end)`. Merges keys from the memtable, all L0 SST files,
+    /// and any L1 SST files whose key range overlaps `[start, end)`, then deduplicates
+    /// and drops any key that has a tombstone in the memtable or an L0 file (a tombstone
+    /// in an L1 file is not explicitly filtered here, since compaction already drops
+    /// tombstones and L1 ranges are non-overlapping).
+    /// # Arguments
+    /// * `start` - Inclusive lower bound of the key range
+    /// * `end` - Exclusive upper bound of the key range
+    /// # Errors
+    /// Returns an `io::Error` if any SST file cannot be read or parsed.
     pub fn scan(&mut self, start: &str, end: &str) -> Result<String> {
         let memtable_keys = self
             .memtable

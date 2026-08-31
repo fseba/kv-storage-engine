@@ -22,14 +22,15 @@ The `StorageEngine` struct provides the core key-value storage functionality:
 - **Manifest**: Tracks SST files in two sections — a flat `[L0]` list and a `[L1]` list of key-range-to-file mappings. Kept in memory on the `StorageEngine` and updated atomically via a temp file rename on each flush and compaction
 - **Negative cache**: An LRU cache of recently queried absent or deleted keys to avoid redundant SST scans
 - **Thread-safe access**: Wrapped in `Arc<Mutex<>>` for concurrent access across HTTP handlers
-- **Simple interface**: Provides `get()`, `set()`, and `delete()` methods for basic operations
+- **Simple interface**: Provides `get()`, `set()`, `delete()`, and `scan()` methods for basic operations
 
 #### Methods
 
 - `new(path)` - Creates a storage engine rooted at `path`, creating the `l0/`/`l1/` directories if needed, recovering the SST counter and in-memory manifest from the `MANIFEST` file, and replaying any unflushed WAL entries into the memtable
 - `set(key: String, value: String) -> Result<()>` - Appends to the WAL, inserts into the memtable, flushes to disk if the memtable is full, and triggers compaction if L0 has reached 5 files
 - `get(key: &str) -> Option<String>` - Retrieves a value by key; checks the memtable, then the negative cache, then L0 SST files newest-to-oldest, then the single L1 SST file whose key range contains the key. Returns `None` for missing or deleted keys
-- `delete(key: &str) -> Result<()>` - Appends a delete record to the WAL, inserts a tombstone into the memtable, and triggers compaction if L0 has reached 5 files
+- `delete(key: &str) -> Result<()>` - Appends a delete record to the WAL, inserts a tombstone into the memtable, flushes to disk if the memtable is full, and triggers compaction if L0 has reached 5 files
+- `scan(start: &str, end: &str) -> Result<String>` - Returns a comma-separated, sorted list of all live (non-deleted) keys in the half-open range `[start, end)`, merging results from the memtable, L0 SST files, and any overlapping L1 SST files
 
 ### HTTP API
 
@@ -71,6 +72,18 @@ Marks the given key as deleted.
 **Example:**
 ```bash
 curl -X DELETE http://127.0.0.1:8080/mykey
+```
+
+#### GET /scan?start={start}&end={end}
+Returns all live keys in the half-open range `[start, end)`.
+
+**Response:**
+- `200 OK` - Returns a comma-separated, sorted list of keys as plain text
+- `500 Internal Server Error` - Failed to read SST files
+
+**Example:**
+```bash
+curl "http://127.0.0.1:8080/scan?start=a&end=m"
 ```
 
 ### Client
